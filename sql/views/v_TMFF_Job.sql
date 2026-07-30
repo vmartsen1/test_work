@@ -34,27 +34,15 @@ GO
 --   * ClosingDate: ODS.TMFF_JOBINTFEXPDTL.STATUSDATE / REFNO1 = 'OPSTATUS_CLOSE' taken from the
 --     Excel mapping as-is; this table isn't referenced anywhere in the existing reference views.
 --   * TSP: Excel gives no source/logic for either system -> NULL.
---   * TEU: reconstructed from CALC.v_TMFF_AllItemsWithTEUAllocation's real allocation logic (see the
---     cte_*TEU* CTEs below), confirmed against that view's own definition. One simplification vs. the
---     original: a shared container/load unit's TEU is split across jobs by CONTAINER_UNID/UNITUNID alone;
---     the original also groups by Company_BK (via CALC.TMFF_AllItems/TMFF_OwnerIdCompany), which only
---     matters if the same numeric CONTAINER_UNID/UNITUNID is reused across different companies.
+--   * TEU: reconstructed from CALC.v_TMFF_AllItemsWithTEUAllocation's real allocation logic (see
+--     cte_TEU below), confirmed against that view's own definition. One simplification vs. the
+--     original: a shared container/load unit's TEU is split across jobs by CONTAINER_UNID/UNITUNID
+--     alone; the original also groups by Company_BK (via CALC.TMFF_AllItems/TMFF_OwnerIdCompany),
+--     which only matters if the same numeric CONTAINER_UNID/UNITUNID is reused across companies.
 -- =====================================================================================================
 CREATE view [CALC].[v_TMFF_Job]
 as
-with cte_JobClean as (
-			select		  UNID
-						, OWNERID
-						, GSHPID
-						, CREATEDATE
-						, clean_SHPNO	=	case when replace(shpno.CleanRaw,'0','') = '' then null else shpno.CleanRaw end
-			from		ODS.TMFF_JOB j
-			outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno
-			where		j.SCD_ActiveFlag = 1
-			and			j.SCD_IsDeleted = 0
-			and			j.VOIDDATE is null
-),
-cte_ShipmentId as ( --same GlobalShipmentId_BK logic as CALC.v_TMFF_Job_GlobalShipmentId_Weight_Volume_Company, rewritten
+with cte_ShipmentId as ( --same GlobalShipmentId_BK logic as CALC.v_TMFF_Job_GlobalShipmentId_Weight_Volume_Company, rewritten
 					--as a single window-function pass instead of a self-join. The self-join version forced 3 scans
 					--of ODS.TMFF_JOB and 2 scalar-UDF calls per row (scalar UDFs run row-by-row and block
 					--parallelism, so with ~550k rows in TMFF_JOB that dominated the whole view's runtime); this
@@ -62,6 +50,9 @@ cte_ShipmentId as ( --same GlobalShipmentId_BK logic as CALC.v_TMFF_Job_GlobalSh
 					--MaxClean within a GSHPID group is equivalent to the original's "count(distinct clean_SHPNO) > 1"
 					--(ambiguous group -> override with the group's cleanest value), while a non-ambiguous group
 					--(or a lone job) still falls through to its own clean_SHPNO, exactly as before.
+					--Two levels of subquery are unavoidable here (not a style choice): clean_SHPNO has to exist
+					--as a real column before MIN/MAX/FIRST_VALUE OVER(...) can be computed on it - a window
+					--function can't reference a column alias defined in the same SELECT list.
 			select		  JOB_UNID				=	UNID
 						, GlobalShipmentId_BK	=	cast(coalesce(
 														case when MinClean <> MaxClean then BestClean end
@@ -73,7 +64,18 @@ cte_ShipmentId as ( --same GlobalShipmentId_BK logic as CALC.v_TMFF_Job_GlobalSh
 									, MinClean	=	min(clean_SHPNO) over (partition by GSHPID)
 									, MaxClean	=	max(clean_SHPNO) over (partition by GSHPID)
 									, BestClean	=	first_value(clean_SHPNO) over (partition by GSHPID order by case when clean_SHPNO is null then 999 else 1 end asc, CREATEDATE asc)
-						from		cte_JobClean
+						from		(
+									select		  UNID
+												, OWNERID
+												, GSHPID
+												, CREATEDATE
+												, clean_SHPNO	=	case when replace(shpno.CleanRaw,'0','') = '' then null else shpno.CleanRaw end
+									from		ODS.TMFF_JOB j
+									outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno
+									where		j.SCD_ActiveFlag = 1
+									and			j.SCD_IsDeleted = 0
+									and			j.VOIDDATE is null
+									) jc
 						) x
 ),
 cte_ClosingDate as (
@@ -122,144 +124,134 @@ cte_JobRoute as (
 -- instead of item-level CALC.TMFF_AllItems (which itself needs CALC.TMFF_Shipment for Company_BK/TransportMode_BK/
 -- ShipmentType_BK). A physical container/load unit can be shared by several jobs (consolidations), so its TEU
 -- is split across them by cargo-volume share (falling back to an even split by item count when volume is 0/null,
--- same fallback the original uses) - that's cte_SeaContainerTEU / cte_LoadUnitTEU below. On top of that, TMFF_SEA
--- and TMFF_ROAD can imply containers/vehicles that never got a real SEACONTITEM/LOADUNITITEM row yet - those are
--- cte_SeaVirtualTEU / cte_RoadVirtualTEU, using CTNQTY1-4/CTNTYPE1-4/ISPARTOF1-4 and VEHICLEQTY1-4/VEHICLETYPE1-4
--- directly (only when the job doesn't already have real container/load-unit rows, same as the original's
--- "left join ... where ...JOB_UNID is null" exclusion). The ROAD branch's original eligibility check
--- (s.TransportMode_BK='Rail' and s.ShipmentType_BK='FCL', both CALC.v_TMFF_Shipment-derived) reduces to
--- jo.TPTTYPE='Rail' and road.LOADTERM='FTL' (with SERVICELEVEL not 'BCN') once you trace through
--- v_TMFF_Shipment's own TransportMode_BK/ShipmentType_BK CASE expressions for a road-sourced job.
-cte_SeaContainerItems as (
-			select		  JOB_UNID			=	sci.JOB_UNID
-						, CONTAINER_UNID	=	sci.CONTAINER_UNID
-						, ItemVolume		=	sum(sci.TOTVOL)
-			from		ODS.TMFF_SEACONTITEM sci
-			where		sci.SCD_ActiveFlag = 1
-			and			sci.SCD_IsDeleted = 0
-			group by	sci.JOB_UNID, sci.CONTAINER_UNID
-),
-cte_Container as (
-			select		  UNID
-						, CalculatedTEU	=	case	when TEU is not null then cast(TEU as decimal(19,2))
-												when CONTTYPE like '%10%' then 0.50
-												when CONTTYPE like '%20%' then 1.00
-												when CONTTYPE like '%40%' then 2.00
-												when CONTTYPE like '%45%' then 2.25
-												else 0
-											end
-			from		ODS.TMFF_CONTAINER
-			where		SCD_ActiveFlag = 1
-			and			SCD_IsDeleted = 0
-),
-cte_SeaContainerTEU as ( --row-level AllocatedTEU per (JOB_UNID, CONTAINER_UNID); needs its own step because
-						 --the window functions below must see the un-grouped rows, before cte_SeaContainerTEUByJob's GROUP BY
-			select		  sci.JOB_UNID
-						, AllocatedTEU	=	coalesce(
-												sci.ItemVolume / nullif(sum(sci.ItemVolume) over (partition by sci.CONTAINER_UNID), 0) * cnt.CalculatedTEU
-											, 1.0 / nullif(count(*) over (partition by sci.CONTAINER_UNID), 0) * cnt.CalculatedTEU
-											)
-			from		cte_SeaContainerItems sci
-			join		cte_Container cnt
-			on			cnt.UNID = sci.CONTAINER_UNID
-),
-cte_SeaContainerTEUByJob as (
-			select		  JOB_UNID
-						, TEU	=	sum(AllocatedTEU)
-			from		cte_SeaContainerTEU
+-- same fallback the original uses) - the first two branches of the union below. On top of that, TMFF_SEA and
+-- TMFF_ROAD can imply containers/vehicles that never got a real SEACONTITEM/LOADUNITITEM row yet - the last two
+-- branches, using CTNQTY1-4/CTNTYPE1-4/ISPARTOF1-4 and VEHICLEQTY1-4/VEHICLETYPE1-4 directly (only when the job
+-- doesn't already have real container/load-unit rows, same as the original's "left join ... where
+-- ...JOB_UNID is null" exclusion). The ROAD branch's original eligibility check (s.TransportMode_BK='Rail' and
+-- s.ShipmentType_BK='FCL', both CALC.v_TMFF_Shipment-derived) reduces to jo.TPTTYPE='Rail' and
+-- road.LOADTERM='FTL' (with SERVICELEVEL not 'BCN') once you trace through v_TMFF_Shipment's own
+-- TransportMode_BK/ShipmentType_BK CASE expressions for a road-sourced job.
+-- All four sources produce the same shape (JOB_UNID, AllocatedTEU), UNION ALL'd and summed once at the end,
+-- rather than one CTE per source plus one CTE per "group by job" step.
+cte_TEU as (
+			select		JOB_UNID, TEU = sum(AllocatedTEU)
+			from		(
+						--containers linked via SEACONTITEM, TEU split across every job sharing the container by cargo-volume share
+						select		  sci.JOB_UNID
+									, AllocatedTEU	=	coalesce(
+															sci.ItemVolume / nullif(sum(sci.ItemVolume) over (partition by sci.CONTAINER_UNID), 0) * cnt.CalculatedTEU
+														, 1.0 / nullif(count(*) over (partition by sci.CONTAINER_UNID), 0) * cnt.CalculatedTEU
+														)
+						from		(
+									select		JOB_UNID, CONTAINER_UNID, ItemVolume = sum(TOTVOL)
+									from		ODS.TMFF_SEACONTITEM
+									where		SCD_ActiveFlag = 1
+									and			SCD_IsDeleted = 0
+									group by	JOB_UNID, CONTAINER_UNID
+									) sci
+						join		(
+									select		  UNID
+												, CalculatedTEU	=	case	when TEU is not null then cast(TEU as decimal(19,2))
+																		when CONTTYPE like '%10%' then 0.50
+																		when CONTTYPE like '%20%' then 1.00
+																		when CONTTYPE like '%40%' then 2.00
+																		when CONTTYPE like '%45%' then 2.25
+																		else 0
+																	end
+									from		ODS.TMFF_CONTAINER
+									where		SCD_ActiveFlag = 1
+									and			SCD_IsDeleted = 0
+									) cnt
+						on			cnt.UNID = sci.CONTAINER_UNID
+
+						union all
+
+						--load units linked via LOADUNITITEM, same volume-share allocation pattern as containers above
+						select		  lui.JOB_UNID
+									, AllocatedTEU	=	coalesce(
+															lui.ItemVolume / nullif(sum(lui.ItemVolume) over (partition by lui.UNITUNID), 0) * lu.CalculatedTEU
+														, 1.0 / nullif(count(*) over (partition by lui.UNITUNID), 0) * lu.CalculatedTEU
+														)
+						from		(
+									select		JOB_UNID, UNITUNID, ItemVolume = sum(TOTVOL)
+									from		ODS.TMFF_LOADUNITITEM
+									where		SCD_ActiveFlag = 1
+									and			SCD_IsDeleted = 0
+									and			JOB_UNID is not null
+									group by	JOB_UNID, UNITUNID
+									) lui
+						join		(
+									select		  UNID
+												, CalculatedTEU	=	case	when UNITTYPE like '%10%' then 0.50
+																		when UNITTYPE like '%20%' then 1.00
+																		when UNITTYPE like '%40%' then 2.00
+																		when UNITTYPE like '%45%' then 2.25
+																	end	--no ELSE here, matching the original (unlike containers, an unrecognized UNITTYPE yields NULL, not 0)
+									from		ODS.TMFF_LOADUNIT
+									where		SCD_ActiveFlag = 1
+									and			SCD_IsDeleted = 0
+									) lu
+						on			lu.UNID = lui.UNITUNID
+
+						union all
+
+						--virtual containers implied directly by TMFF_SEA, only for jobs with no real SEACONTITEM row yet
+						select		  sea.JOB_UNID
+									, AllocatedTEU	=	v.qty * case	when v.typ like '%10%' then 0.50
+																	when v.typ like '%20%' then 1.00
+																	when v.typ like '%40%' then 2.00
+																	when v.typ like '%45%' then 2.25
+																	else 0
+																end
+						from		ODS.TMFF_SEA sea
+						cross apply	(values	  (sea.CTNQTY1, sea.CTNTYPE1, sea.ISPARTOF1)
+											, (sea.CTNQTY2, sea.CTNTYPE2, sea.ISPARTOF2)
+											, (sea.CTNQTY3, sea.CTNTYPE3, sea.ISPARTOF3)
+											, (sea.CTNQTY4, sea.CTNTYPE4, sea.ISPARTOF4)
+									) v(qty, typ, ispart)
+						left join	(select distinct JOB_UNID from ODS.TMFF_SEACONTITEM where SCD_ActiveFlag = 1 and SCD_IsDeleted = 0) sci
+						on			sci.JOB_UNID = sea.JOB_UNID
+						where		sea.SCD_ActiveFlag = 1
+						and			sea.SCD_IsDeleted = 0
+						and			coalesce(sea.CTNQTY1, sea.CTNQTY2, sea.CTNQTY3, sea.CTNQTY4) > 0
+						and			sea.LOADTERM in ('FCL','CONS')
+						and			sci.JOB_UNID is null	--exclude jobs that already have real SEACONTITEM rows (covered by the first branch above)
+						and			v.qty > 0
+						and			v.ispart = 0
+
+						union all
+
+						--virtual vehicles implied directly by TMFF_ROAD (Rail+FCL only), for jobs with no real LOADUNITITEM row yet
+						select		  road.JOB_UNID
+									, AllocatedTEU	=	v.qty * case	when v.typ like '%10%' then 0.50
+																	when v.typ like '%20%' then 1.00
+																	when v.typ like '%40%' then 2.00
+																	when v.typ like '%45%' then 2.25
+																	else 0
+																end
+						from		ODS.TMFF_ROAD road
+						join		ODS.TMFF_JOBOTHER jo
+						on			jo.JOB_UNID = road.JOB_UNID
+						and			jo.SCD_ActiveFlag = 1
+						and			jo.SCD_IsDeleted = 0
+						cross apply	(values	  (road.VEHICLEQTY1, road.VEHICLETYPE1)
+											, (road.VEHICLEQTY2, road.VEHICLETYPE2)
+											, (road.VEHICLEQTY3, road.VEHICLETYPE3)
+											, (road.VEHICLEQTY4, road.VEHICLETYPE4)
+									) v(qty, typ)
+						left join	(select distinct JOB_UNID from ODS.TMFF_LOADUNITITEM where SCD_ActiveFlag = 1 and SCD_IsDeleted = 0) lui
+						on			lui.JOB_UNID = road.JOB_UNID
+						where		road.SCD_ActiveFlag = 1
+						and			road.SCD_IsDeleted = 0
+						and			coalesce(road.VEHICLEQTY1, road.VEHICLEQTY2, road.VEHICLEQTY3, road.VEHICLEQTY4) > 0
+						and			jo.TPTTYPE = 'Rail'
+						and			isnull(jo.SERVICELEVEL,'') <> 'BCN'
+						and			road.LOADTERM = 'FTL'
+						and			lui.JOB_UNID is null	--exclude jobs that already have real LOADUNITITEM rows (covered by the second branch above)
+						and			v.qty > 0
+						) all_teu
 			group by	JOB_UNID
-),
-cte_LoadUnitItems as (
-			select		  JOB_UNID	=	lui.JOB_UNID
-						, UNITUNID	=	lui.UNITUNID
-						, ItemVolume	=	sum(lui.TOTVOL)
-			from		ODS.TMFF_LOADUNITITEM lui
-			where		lui.SCD_ActiveFlag = 1
-			and			lui.SCD_IsDeleted = 0
-			and			lui.JOB_UNID is not null
-			group by	lui.JOB_UNID, lui.UNITUNID
-),
-cte_LoadUnit as (
-			select		  UNID
-						, CalculatedTEU	=	case	when UNITTYPE like '%10%' then 0.50
-												when UNITTYPE like '%20%' then 1.00
-												when UNITTYPE like '%40%' then 2.00
-												when UNITTYPE like '%45%' then 2.25
-											end	--no ELSE here, matching the original (unlike containers, an unrecognized UNITTYPE yields NULL, not 0)
-			from		ODS.TMFF_LOADUNIT
-			where		SCD_ActiveFlag = 1
-			and			SCD_IsDeleted = 0
-),
-cte_LoadUnitTEU as ( --row-level AllocatedTEU per (JOB_UNID, UNITUNID); same reason as cte_SeaContainerTEU above
-			select		  lui.JOB_UNID
-						, AllocatedTEU	=	coalesce(
-												lui.ItemVolume / nullif(sum(lui.ItemVolume) over (partition by lui.UNITUNID), 0) * lu.CalculatedTEU
-											, 1.0 / nullif(count(*) over (partition by lui.UNITUNID), 0) * lu.CalculatedTEU
-											)
-			from		cte_LoadUnitItems lui
-			join		cte_LoadUnit lu
-			on			lu.UNID = lui.UNITUNID
-),
-cte_LoadUnitTEUByJob as (
-			select		  JOB_UNID
-						, TEU	=	sum(AllocatedTEU)
-			from		cte_LoadUnitTEU
-			group by	JOB_UNID
-),
-cte_SeaVirtualTEU as (
-			select		  JOB_UNID	=	sea.JOB_UNID
-						, TEU		=	sum(v.qty * case	when v.typ like '%10%' then 0.50
-														when v.typ like '%20%' then 1.00
-														when v.typ like '%40%' then 2.00
-														when v.typ like '%45%' then 2.25
-														else 0
-													end)
-			from		ODS.TMFF_SEA sea
-			cross apply	(values	  (sea.CTNQTY1, sea.CTNTYPE1, sea.ISPARTOF1)
-									, (sea.CTNQTY2, sea.CTNTYPE2, sea.ISPARTOF2)
-									, (sea.CTNQTY3, sea.CTNTYPE3, sea.ISPARTOF3)
-									, (sea.CTNQTY4, sea.CTNTYPE4, sea.ISPARTOF4)
-						) v(qty, typ, ispart)
-			left join	(select distinct JOB_UNID from ODS.TMFF_SEACONTITEM where SCD_ActiveFlag = 1 and SCD_IsDeleted = 0) sci
-			on			sci.JOB_UNID = sea.JOB_UNID
-			where		sea.SCD_ActiveFlag = 1
-			and			sea.SCD_IsDeleted = 0
-			and			coalesce(sea.CTNQTY1, sea.CTNQTY2, sea.CTNQTY3, sea.CTNQTY4) > 0
-			and			sea.LOADTERM in ('FCL','CONS')
-			and			sci.JOB_UNID is null	--exclude jobs that already have real SEACONTITEM rows (those are covered by cte_SeaContainerTEUByJob)
-			and			v.qty > 0
-			and			v.ispart = 0
-			group by	sea.JOB_UNID
-),
-cte_RoadVirtualTEU as (
-			select		  JOB_UNID	=	road.JOB_UNID
-						, TEU		=	sum(v.qty * case	when v.typ like '%10%' then 0.50
-														when v.typ like '%20%' then 1.00
-														when v.typ like '%40%' then 2.00
-														when v.typ like '%45%' then 2.25
-														else 0
-													end)
-			from		ODS.TMFF_ROAD road
-			join		ODS.TMFF_JOBOTHER jo
-			on			jo.JOB_UNID = road.JOB_UNID
-			and			jo.SCD_ActiveFlag = 1
-			and			jo.SCD_IsDeleted = 0
-			cross apply	(values	  (road.VEHICLEQTY1, road.VEHICLETYPE1)
-									, (road.VEHICLEQTY2, road.VEHICLETYPE2)
-									, (road.VEHICLEQTY3, road.VEHICLETYPE3)
-									, (road.VEHICLEQTY4, road.VEHICLETYPE4)
-						) v(qty, typ)
-			left join	(select distinct JOB_UNID from ODS.TMFF_LOADUNITITEM where SCD_ActiveFlag = 1 and SCD_IsDeleted = 0) lui
-			on			lui.JOB_UNID = road.JOB_UNID
-			where		road.SCD_ActiveFlag = 1
-			and			road.SCD_IsDeleted = 0
-			and			coalesce(road.VEHICLEQTY1, road.VEHICLEQTY2, road.VEHICLEQTY3, road.VEHICLEQTY4) > 0
-			and			jo.TPTTYPE = 'Rail'
-			and			isnull(jo.SERVICELEVEL,'') <> 'BCN'
-			and			road.LOADTERM = 'FTL'
-			and			lui.JOB_UNID is null	--exclude jobs that already have real LOADUNITITEM rows (those are covered by cte_LoadUnitTEUByJob)
-			and			v.qty > 0
-			group by	road.JOB_UNID
 )
 select		  JOB_UNID					=	j.UNID
 			, Branch					=	cast(j.OWNERID													as varchar(50))
@@ -321,7 +313,7 @@ select		  JOB_UNID					=	j.UNID
 			, ShipperState				=	cast(jo.SHPRSTATEPROV											as varchar(50))
 			, ShipperPostalCode			=	cast(jo.SHPRPOSTALCODE											as varchar(50))
 			, ShipperCountryCode		=	cast(jo.SHPRCTRYCODE											as varchar(50))
-			, TEU						=	isnull(cntTEU.TEU,0) + isnull(luTEU.TEU,0) + isnull(seaV.TEU,0) + isnull(roadV.TEU,0)
+			, TEU						=	isnull(teu.TEU,0)
 			, TSP						=	cast(null														as varchar(50))		--Excel gives no source/logic for TSP
 			, VesselName				=	cast(mo.VESSELNAME												as varchar(50))
 			, VIA						=	cast(j.VIACTRY + j.VIACITY										as varchar(50))
@@ -369,14 +361,8 @@ and			mo.SCD_ActiveFlag = 1
 and			mo.SCD_IsDeleted = 0
 left join	cte_JobRoute jro
 on			jro.JOB_UNID = j.UNID
-left join	cte_SeaContainerTEUByJob cntTEU
-on			cntTEU.JOB_UNID = j.UNID
-left join	cte_LoadUnitTEUByJob luTEU
-on			luTEU.JOB_UNID = j.UNID
-left join	cte_SeaVirtualTEU seaV
-on			seaV.JOB_UNID = j.UNID
-left join	cte_RoadVirtualTEU roadV
-on			roadV.JOB_UNID = j.UNID
+left join	cte_TEU teu
+on			teu.JOB_UNID = j.UNID
 outer apply	(
 			select		MasterCode	=	case	when j.SHPTYPE = 'D'
 												then coalesce(sea.MBLNO, j.SHPNO)
