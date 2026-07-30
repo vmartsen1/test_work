@@ -29,6 +29,11 @@ where flagged - taken from the Excel mapping / handoff text without independent 
   city/state column on FMPARTYADDR, matching that proven pattern.
 - TMFF: `CALC.v_TMFF_Job_GlobalShipmentId_Weight_Volume_Company` and `CALC.v_TMFF_JOBPARTY`
   (pivot) fully read and inlined per the handoff's own CALC-replacement table.
+- TMFF: `ODS.TMFF_CONTAINER` (TEU, CONTTYPE), `ODS.TMFF_LOADUNIT` (UNITTYPE), `ODS.TMFF_SEA`
+  (CTNQTY1-4, CTNTYPE1-4, ISPARTOF1-4, LOADTERM), `ODS.TMFF_ROAD` (VEHICLEQTY1-4, VEHICLETYPE1-4,
+  LOADTERM) confirmed via `CALC.v_TMFF_AllItemsWithTEUAllocation` / `CALC.v_TMFF_AllItems`
+  (the TEU-allocation logic those two views implement at item grain is reconstructed at job grain
+  in `v_TMFF_Job`'s TEU CTEs).
 - OPS: `ODS.NORAMOPSDW_tblAWB`, `tblMAWB`, `tblMAWBOcean`, `xrfMAWBAWB`, `tblAWBPieces`,
   `tblAWBCalcValues`, `tblAWBInternational`, `tblICO`, `lkpDepartment` (DeptName, TransportMode_BK,
   ImpExp), `lkpVendor` (VendorNo), `tblCustomer` (Address1-3, City, Country, Zip, State, CustName,
@@ -41,7 +46,7 @@ where flagged - taken from the Excel mapping / handoff text without independent 
 |---|---|---|
 | TMFF ClosingDate | `ODS.TMFF_JOBINTFEXPDTL.STATUSDATE`, filter `REFNO1='OPSTATUS_CLOSE'` | This table isn't referenced anywhere in the supplied reference views. |
 | TMFF FlightNumber | `ODS.TMFF_AIR.BY1FLTNO` | TMFF_AIR only appears in reference code via `SCD_UpdateDate`. |
-| TMFF Master (MBLNO/TOTTEU) | `ODS.TMFF_SEA.MBLNO`, `.TOTTEU` | MBLNO is confirmed (used in `v_TMFF_Shipment`); TOTTEU is not. |
+| TMFF Master (MBLNO) | `ODS.TMFF_SEA.MBLNO` | Confirmed (used in `v_TMFF_Shipment`). |
 | OPS ClosingDate | `ODS.NORAMOPSDW_tblAWBRecap.EntryDate` | Only `tblAWBRecap.WeekEnding` is confirmed elsewhere. |
 | OPS CustomerID/Contact/Phone | `tblCustomer.SlsPsnID/Contact/Phone` | Not used in any reference view. `SlsPsnID` → CustomerID looks like it might actually be a **salesperson** ID, not a customer ID — worth a business sanity check regardless of DDL. |
 | OPS Consignee/Shipper Name/Address/City/State/Zip/Country | `tblAWBConsignee` / `tblAWBShipper` | Only the `*ID` columns of these two tables (AwbConsigneeID/AwbShipperID) are used anywhere in the reference views; the Name/Address columns are taken from Excel verbatim. |
@@ -66,8 +71,16 @@ where flagged - taken from the Excel mapping / handoff text without independent 
   the cutoff boundary.
 - **TSP** and **TMFF CarrierName**: no source in Excel or the reference views on either system →
   left `NULL`, per the handoff's own note that no source was found.
-- **TEU (TMFF)**: only `TMFF_SEA.TOTTEU` (air/sea) is used; road-shipment TEU (from
-  LOADUNITITEM/LOADUNIT, per the Excel comment) is out of scope for this pass.
+- **TEU (TMFF)**: reconstructed at job grain from the real `CALC.v_TMFF_AllItemsWithTEUAllocation` /
+  `CALC.v_TMFF_AllItems` logic (both fully confirmed, not the earlier `TMFF_SEA.TOTTEU` guess), via
+  the `cte_SeaContainerItems`/`cte_Container`/`cte_SeaContainerTEU(ByJob)`,
+  `cte_LoadUnitItems`/`cte_LoadUnit`/`cte_LoadUnitTEU(ByJob)`, `cte_SeaVirtualTEU` and
+  `cte_RoadVirtualTEU` CTEs in the view. One deliberate simplification: a container/load unit shared
+  across jobs (consolidations) has its TEU split by `CONTAINER_UNID`/`UNITUNID` alone, whereas the
+  original also partitions by `Company_BK` (resolved through `CALC.TMFF_AllItems` →
+  `CALC.TMFF_OwnerIdCompany`) - only matters if the same numeric container/load-unit id is reused
+  across different companies, which seems unlikely for a physical container/unit key but wasn't
+  verified.
 
 ## Not carried over from CALC (per handoff, unchanged)
 
