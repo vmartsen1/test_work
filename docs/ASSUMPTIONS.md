@@ -112,6 +112,23 @@ independent DDL confirmation.
   AWBs. This is existing production logic, not something new - see the in-line comment at that join
   in `sql/views/v_Job.sql`.
 
+## Bugs found and fixed in final review
+
+- **TMFF branch had no row filter at all** on `ODS.TMFF_JOB` (no `WHERE` before the `union all`) -
+  it would have returned every historical SCD version plus voided/deleted jobs. Added
+  `where j.SCD_ActiveFlag = 1 and j.SCD_IsDeleted = 0 and j.VOIDDATE is null` back.
+- **OPS branch's ICO active/deleted filter was on the wrong join** - `i.SCD_ActiveFlag = 1 and
+  i.SCD_IsDeleted = 0` had ended up attached to the `vnd` (vendor) `LEFT JOIN`'s `ON` clause instead
+  of the `i` (`tblICO`) join's own `ON` clause. Since `vnd` is a `LEFT JOIN`, that condition only
+  affected whether vendor columns resolved - it did not actually exclude inactive/deleted ICOs from
+  the result, unlike the original `v_NORAMOPSDW_Shipment`. Moved back onto `i`'s own join.
+- Confirmed the OPS slave-AWB exclusion (`sam`, self-join subquery) is functionally identical to the
+  original 4-CTE version it replaced: `row_number() over (partition by RowGuid_AWB order by ...)` is
+  deterministic per physical row regardless of whether it's computed once over a shared pool (the
+  original) or twice over two separately-filtered copies of the same pool (this version) - master and
+  slave rows never share a `RowGuid_AWB`, so splitting before vs. after computing `ix` gives the same
+  result either way.
+
 ## Suggested next step
 
 Re-upload `TMFF_OPS.sql` (or just the DDL for `TMFF_JOBINTFEXPDTL`, `NORAMOPSDW_tblAWBConsignee`,

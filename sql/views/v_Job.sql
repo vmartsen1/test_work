@@ -341,6 +341,9 @@ and			mo.SCD_ActiveFlag = 1
 and			mo.SCD_IsDeleted = 0
 left join	cte_TEU teu
 on			teu.JOB_UNID = j.UNID
+where		j.SCD_ActiveFlag = 1
+and			j.SCD_IsDeleted = 0
+and			j.VOIDDATE is null
 
 
 
@@ -455,6 +458,8 @@ from		(
 			) a
 join		ODS.NORAMOPSDW_tblICO i
 on			a.rowguid_ICO = i.rowguid_ICO
+and			i.SCD_ActiveFlag = 1
+and			i.SCD_IsDeleted = 0
 left join	(
 			select		*
 			from		(
@@ -477,8 +482,6 @@ left join	(
 			where		ix = 1
 			) vnd
 on			vnd.rowguid_AWB = a.rowguid_AWB
-and			i.SCD_ActiveFlag = 1
-and			i.SCD_IsDeleted = 0
 left join	(
 			select		  rowguid_AWB
 						, FghtDesc		=	cast(string_agg(replace(cast(nullif(ap.FghtDesc,'') as varchar(max)),'"',''''),',')								as varchar(500))
