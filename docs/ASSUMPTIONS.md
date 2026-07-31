@@ -1,4 +1,4 @@
-# v_TMFF_Job / v_NORAMOPSDW_Job — assumptions and open items
+# Reports.v_Job — assumptions and open items
 
 This pass was done with these inputs only:
 - `docs/HANDOFF_SUMMARY.md` (summary from the previous chat session)
@@ -8,10 +8,14 @@ This pass was done with these inputs only:
 **Not re-uploaded this session** (the handoff explicitly listed these as "files the user will
 attach again"): `TMFF_OPS.sql` (raw DDL — the actual source-of-truth for column names/existence),
 the previous `v_Job_views.sql` / `v_Job_views_ODS_only.sql` drafts, and `consignee_block_fix.sql`.
-Because of that, `sql/views/v_TMFF_Job.sql` and `sql/views/v_NORAMOPSDW_Job.sql` were written from
-scratch against the reference views + Excel + handoff notes, not as a patch on top of the earlier
-draft. Everything below is either directly confirmed by a real, working reference view, or -
-where flagged - taken from the Excel mapping / handoff text without independent DDL confirmation.
+Because of that, `sql/views/v_Job.sql` (`Reports.v_Job`, one UNION ALL of a TMFF branch and an OPS
+branch, one row per JOB/AWB) was written from scratch against the reference views + Excel + handoff
+notes, not as a patch on top of the earlier draft. It started as two separate views
+(`CALC.v_TMFF_Job` / `CALC.v_NORAMOPSDW_Job`), which the user then merged into one `Reports.v_Job`
+and reworked (no more CTEs for single-use subqueries, only for the two genuinely reused pieces:
+`cte_ShipmentId` and `cte_TEU`). Everything below is either directly confirmed by a real, working
+reference view, or - where flagged - taken from the Excel mapping / handoff text without
+independent DDL confirmation.
 
 ## Confirmed directly from the reference views (high confidence)
 
@@ -82,14 +86,31 @@ where flagged - taken from the Excel mapping / handoff text without independent 
   across different companies, which seems unlikely for a physical container/unit key but wasn't
   verified.
 
-## Not carried over from CALC (per handoff, unchanged)
+## Not carried over from CALC (per handoff), plus one reintroduced on purpose
 
-- `CALC.BiRef_AirLineMapping` (IATA→carrier fallback) is not reintroduced — `CarrierCode` can be
-  `NULL` in the rare case there's no `CARRIERCODE`/`CARRIERID` (TMFF) or vendor match (OPS).
+- `CALC.BiRef_AirLineMapping` (IATA→carrier fallback, TMFF `CarrierCode`) **was reintroduced by the
+  user** in the merged `Reports.v_Job` (`left join CALC.BiRef_AirLineMapping airm ...`) - this is
+  the one remaining CALC dependency in the view, flagged in-line with `-- should we remove that
+  table??`. Pending a decision; everything else in the view stays ODS-only.
 - `CALC.TMFF_OwnerIdCompany` is not reintroduced — the rare `ShipmentID` fallback branch uses
   `OWNERID` directly instead of a resolved `Company_BK`.
 - `utilities.ufn_GetCleanGlobalShipmentId` / `utilities.ufn_GetHashedUID` are used unchanged as
   black boxes (schema `utilities`, not `CALC`).
+
+## Cross-branch consistency note (only matters now that both systems are UNION ALL'd together)
+
+- **`ModeOfTransport`**: TMFF yields `AIR`/`SEA`/`ROAD`/`COU`/`OTH` (or whatever free text sits in
+  `JOBOTHER.TPTTYPE`, e.g. `Rail`) while OPS yields `Air`/`Sea`/`Surface`/`Warehouse`/`Other` (from
+  `lkpDepartment.TransportMode_BK`) - different casing and partly different vocabulary. Not a bug
+  under the database's default case-insensitive collation (`WHERE ModeOfTransport = 'Air'` matches
+  `'AIR'` too), but worth knowing if this ever runs under a case-sensitive collation or gets
+  consumed by something doing exact string matching outside SQL.
+- **Slave-AWB exclusion** (`sam` derived table, OPS branch): inlined from
+  `CALC.v_NORAMOPSDW_AWB_SlavesAndMasters` (COBI-7158 - NORAMOPSDW duplicates some AWB rows under a
+  suffixed HWB, e.g. `12345-67890A` is a "slave" duplicate of master `12345-67890`). Without this
+  join + the `sam.Slave_RowGuid_AWB is null` filter, the OPS branch returns duplicate rows for those
+  AWBs. This is existing production logic, not something new - see the in-line comment at that join
+  in `sql/views/v_Job.sql`.
 
 ## Suggested next step
 
