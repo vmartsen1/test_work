@@ -112,6 +112,41 @@ independent DDL confirmation.
   AWBs. This is existing production logic, not something new - see the in-line comment at that join
   in `sql/views/v_Job.sql`.
 
+## Performance pass (~20 min runtime for ~4M rows)
+
+Two redundant full scans removed - both were "the same filtered pool of a big table, scanned twice
+for a self-join" (the same anti-pattern, once per branch):
+
+- **TMFF**: `cte_ShipmentId` used to scan `ODS.TMFF_JOB` a second time (with its own
+  `utilities.ufn_GetCleanGlobalShipmentId` call per row) just to compute `GlobalShipmentId_BK`, then
+  joined that back to the main query's own scan of the same table. Folded directly into the main
+  query instead: the UDF call becomes an `OUTER APPLY` right after `from ODS.TMFF_JOB j`, and the
+  `MIN`/`MAX`/`FIRST_VALUE` windows that used to live in `cte_ShipmentId` are now computed straight
+  in the `ShipmentID` column of the final `SELECT` (window functions can reference any join/apply
+  alias already in scope - they don't need their own CTE). `ODS.TMFF_JOB` is now read once, not
+  twice, and the whole CTE is gone.
+- **OPS**: the `sam` slave-AWB detection used a self-join (`slv` join `mst`) that scanned the
+  filtered `TGOPSINTL` + HWB-pattern pool of `ODS.NORAMOPSDW_tblAWB` twice. Rewritten as a single
+  scan: each row gets a `MasterKey` (its own HWB if master-shaped, or the HWB it would be a slave of
+  if slave-shaped), then `MAX(...) OVER (PARTITION BY MasterKey)` checks whether a live master with
+  that key exists anywhere in the pool - same result, one scan instead of two. Worth calling out:
+  `HWB LIKE '[0-9][0-9]...'` (a character-class pattern) can't use an index seek in SQL Server, so
+  every scan of this filtered pool was already a full scan - halving the scan count here is a real win.
+
+**Most likely remaining dominant cost, not fixed here**: `utilities.ufn_GetCleanGlobalShipmentId`
+(OPS `ShipmentID`) and `utilities.ufn_GetHashedUID` (`UniqueRecordKey`, both branches) are scalar
+UDFs called once per *final output row* - at ~4M rows that's ~4-8M scalar function calls, and scalar
+UDFs in SQL Server normally execute row-by-row with no parallelism (unless SQL Server 2019+'s Scalar
+UDF Inlining kicks in, which requires database compatibility level ≥ 150 and a function body simple
+enough to qualify - no cursors, no multiple statements with branching, etc.). Worth checking:
+1. The database's compatibility level (`SELECT compatibility_level FROM sys.databases WHERE name = 'SGLBI'`).
+2. Whether these two functions currently qualify for inlining - the query plan will show them as a
+   separate "Scalar Function" / UDX operator with high cost if not inlined, versus disappearing into
+   the plan if they are.
+Since these are treated as black boxes here (no visibility into their bodies, and deliberately not
+touched to avoid silently changing ID values), this can't be fixed from the view side - it would need
+looking at the functions themselves.
+
 ## Bugs found and fixed in final review
 
 - **TMFF branch had no row filter at all** on `ODS.TMFF_JOB` (no `WHERE` before the `union all`) -

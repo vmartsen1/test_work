@@ -22,36 +22,7 @@ GO
 -- =====================================================================================================
 alter view [Reports].[v_Job]
 as
-with cte_ShipmentId as ( --same GlobalShipmentId_BK logic as CALC.v_TMFF_Job_GlobalShipmentId_Weight_Volume_Company, rewritten
-					--as a single window-function pass instead of a self-join (avoids 3 scans of ODS.TMFF_JOB and
-					--2 scalar-UDF calls per row - see commit history for why). Two levels of subquery are needed:
-					--clean_SHPNO has to exist as a real column before MIN/MAX/FIRST_VALUE OVER(...) can use it.
-			select		  JOB_UNID				=	UNID
-						, GlobalShipmentId_BK	=	cast(coalesce(
-														case when MinClean <> MaxClean then BestClean end
-													, clean_SHPNO
-													, 'TMFF|' + OWNERID + '|' + cast(UNID as varchar)
-													) as varchar(150))
-			from		(
-						select		  *
-									, MinClean	=	min(clean_SHPNO) over (partition by GSHPID)
-									, MaxClean	=	max(clean_SHPNO) over (partition by GSHPID)
-									, BestClean	=	first_value(clean_SHPNO) over (partition by GSHPID order by case when clean_SHPNO is null then 999 else 1 end asc, CREATEDATE asc)
-						from		(
-									select		  UNID
-												, OWNERID
-												, GSHPID
-												, CREATEDATE
-												, clean_SHPNO	=	case when replace(shpno.CleanRaw,'0','') = '' then null else shpno.CleanRaw end
-									from		ODS.TMFF_JOB j
-									outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno
-									where		j.SCD_ActiveFlag = 1
-									and			j.SCD_IsDeleted = 0
-									and			j.VOIDDATE is null
-									) jc
-						) x
-),
-cte_TEU as ( --TEU reconstructed at job grain from CALC.v_TMFF_AllItemsWithTEUAllocation's real allocation logic
+with cte_TEU as ( --TEU reconstructed at job grain from CALC.v_TMFF_AllItemsWithTEUAllocation's real allocation logic
 			--(container/load-unit TEU split by cargo-volume share across every job sharing the container, plus
 			--virtual containers/vehicles implied by TMFF_SEA/TMFF_ROAD when no real container/load-unit row
 			--exists yet) - see commit history for the full derivation. All four sources UNION ALL'd, one
@@ -223,7 +194,13 @@ select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
 			, PORETDDate				=	j.PORETDDATE
 			, ServiceLevel				=	cast(jo.SERVICELEVEL											as varchar(50))
 			, ServiceType				=	cast(jo.SERVICETYPE												as varchar(50))
-			, ShipmentID				=	cast(sid.GlobalShipmentId_BK									as varchar(150))
+			, ShipmentID				=	cast(coalesce(
+													case	when min(shpnoc.clean_SHPNO) over (partition by j.GSHPID) <> max(shpnoc.clean_SHPNO) over (partition by j.GSHPID)
+															then first_value(shpnoc.clean_SHPNO) over (partition by j.GSHPID order by case when shpnoc.clean_SHPNO is null then 999 else 1 end asc, j.CREATEDATE asc)
+														end
+												, shpnoc.clean_SHPNO
+												, 'TMFF|' + j.OWNERID + '|' + cast(j.UNID as varchar)
+												) as varchar(150))
 			, ShipperID					=	cast(j.PARTYID_SHPR												as varchar(50))
 			, ShipperName				=	cast(j.SHPRNAME													as varchar(100))
 			, ShipperAddress1			=	cast(jo.SHPRADDR1												as varchar(50))
@@ -247,6 +224,10 @@ select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
 			, DataAgeCOLD				=	(select max(v) from (values (j.SCD_UpdateDate), (jo.SCD_UpdateDate), (custp.SCD_UpdateDate), (custpa.SCD_UpdateDate)) x(v))
 			, RecordChangeDateTime		=	getdate()
 from		ODS.TMFF_JOB j
+outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno --same GlobalShipmentId_BK cleaning as CALC.v_TMFF_Job_GlobalShipmentId_Weight_Volume_Company;
+																					  --folded into the main scan of ODS.TMFF_JOB instead of a separate cte_ShipmentId
+																					  --(that used to re-scan the whole table + re-call this UDF once per row all over again)
+cross apply	(select clean_SHPNO = case when replace(shpno.CleanRaw,'0','') = '' then null else shpno.CleanRaw end) shpnoc
 left join	(
 			select		  JOB_UNID
 						, ClosingDate	=	min(STATUSDATE)
@@ -333,8 +314,6 @@ outer apply	(
 			) tm
 left join	CALC.BiRef_AirLineMapping airm -- should we remove that table?? Carrier Code relates to it
 on			airm.[3DigitIATA] = left(mc.MasterCode, 3)
-left join	cte_ShipmentId sid
-on			sid.JOB_UNID = j.UNID
 left join	ODS.TMFF_VEWMOTHERVESSEL mo
 on			mo.JOBUNID = j.UNID
 and			mo.SCD_ActiveFlag = 1
@@ -634,37 +613,39 @@ and			shp.SCD_ActiveFlag = 1
 and			shp.SCD_IsDeleted = 0
 left join	( --slave-AWB detection, inlined from CALC.v_NORAMOPSDW_AWB_SlavesAndMasters (COBI-7158: NORAMOPSDW
 			--duplicates some AWB rows under a suffixed HWB - "12345-67890A" is a duplicate/"slave" of master
-			--"12345-67890" - so those duplicates get excluded below). One filtered pool of tblAWB, self-joined:
-			--the "slv" side keeps only the long/suffixed HWBs, the "mst" side only the exact 11-char HWBs.
-			select		  Slave_RowGuid_AWB	=	slv.rowguid_AWB
+			--"12345-67890"). Rewritten as a single scan of the filtered tblAWB pool + two window-function passes
+			--instead of a self-join (the self-join version scanned this same filtered pool twice - LIKE
+			--patterns using character classes like '[0-9]' can't use an index seek in SQL Server, so each scan
+			--was a full scan of this table). Each row gets a MasterKey (its own HWB if master-shaped, or the
+			--HWB it would be a slave of if slave-shaped); MAX(...) OVER(PARTITION BY MasterKey) then checks
+			--whether a live (ix=1), master-shaped row with that same key exists anywhere in the pool.
+			select		  Slave_RowGuid_AWB	=	rowguid_AWB
 			from		(
-						select		*, ix = row_number() over (partition by RowGuid_AWB order by HWB desc, SCD_UpdateDate desc)
-						from		ODS.NORAMOPSDW_tblAWB
-						where		LinkServer = 'TGOPSINTL'
-						and			HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9]%'
-						and			SCD_ActiveFlag = 1
-						and			SCD_IsDeleted = 0
-						and			(	coalesce(cast(ETADate as date), cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
-									or	coalesce(cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
-									)
-						) slv
-			join		(
-						select		*, ix = row_number() over (partition by RowGuid_AWB order by HWB desc, SCD_UpdateDate desc)
-						from		ODS.NORAMOPSDW_tblAWB
-						where		LinkServer = 'TGOPSINTL'
-						and			HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9]%'
-						and			SCD_ActiveFlag = 1
-						and			SCD_IsDeleted = 0
-						and			(	coalesce(cast(ETADate as date), cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
-									or	coalesce(cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
-									)
-						) mst
-			on			mst.HWB = left(slv.HWB, 11)
-			and			mst.ix = 1
-			and			len(mst.HWB) = 11
-			where		slv.ix = 1
-			and			len(slv.HWB) > 11
-			and			slv.HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][A-Z]%'
+						select		  rowguid_AWB
+									, ix
+									, IsSlaveShape
+									, HasMasterInPool	=	max(case when IsSlaveShape = 0 and ix = 1 then 1 else 0 end) over (partition by MasterKey)
+						from		(
+									select		  rowguid_AWB
+												, ix			=	row_number() over (partition by RowGuid_AWB order by HWB desc, SCD_UpdateDate desc)
+												, IsSlaveShape	=	case when len(HWB) > 11 and HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][A-Z]%' then 1 else 0 end
+												, MasterKey		=	case	when len(HWB) > 11 and HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][A-Z]%' then left(HWB,11)
+																		when len(HWB) = 11 then HWB
+																		else null
+																	end
+									from		ODS.NORAMOPSDW_tblAWB
+									where		LinkServer = 'TGOPSINTL'
+									and			HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9]%'
+									and			SCD_ActiveFlag = 1
+									and			SCD_IsDeleted = 0
+									and			(	coalesce(cast(ETADate as date), cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
+												or	coalesce(cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
+												)
+									) t0
+						) t1
+			where		ix = 1
+			and			IsSlaveShape = 1
+			and			HasMasterInPool = 1
 			) sam
 on			sam.Slave_RowGuid_AWB = a.rowguid_AWB
 where		i.ICOID not in ('9999','8888','CPH99','SHARED','0000', 'BATCH','GOT99')
