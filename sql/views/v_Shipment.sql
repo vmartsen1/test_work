@@ -5,9 +5,34 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
+-- =====================================================================================================
+-- View:    Reports.v_Shipment
+-- Purpose: 1 row = 1 unique shipment (dedup by House number, scoped per System_BK, earliest CreateDate
+--          wins - JOB_UNID as tie-break). See docs/ASSUMPTIONS_Shipment.md for the field-mapping story.
+--
+-- Shape: instead of building every output column for every JOB/AWB and only then throwing away the
+-- duplicates (like the first version of this view did), the winning JOB_UNID per unique shipment is
+-- picked FIRST from a cheap, join-light pass (cte_Candidates/cte_Winners - just House/CreateDate/
+-- JOB_UNID, which sit straight on the driving tables), and only the winners get the full set of detail
+-- joins (JOBOTHER, FMPARTY chain, AIR/SEA/JOBROUTE, TEU on the TMFF side; vendor/pieces/consignee/
+-- customer/mawb/department/shipper etc. on the OPS side). This avoids running that whole join fan-out,
+-- and (on OPS) the non-seekable LIKE-based slave-AWB detection, for every job/AWB that ends up discarded
+-- by the dedup anyway.
+--
+-- Exception: TMFF's ShipmentID is computed by a window function partitioned by GSHPID across ALL active
+-- TMFF_JOB rows sharing that group (to pick a canonical clean SHPNO across the group) - it can't be
+-- restricted to just the House-dedup winners without risking missing a sibling row that the window needs
+-- to see. So it's computed once, up front, over the full active population in cte_TMFF_ShipmentId (same
+-- cost as before - this was always the expensive part), and simply looked up by JOB_UNID for the
+-- winners. OPS's ShipmentID has no such cross-row dependency (it's a pure function of that AWB's own
+-- joined fields), so it stays inline in the detail branch like everything else.
+-- =====================================================================================================
 create view [Reports].[v_Shipment]
 as
-with cte_TEU as (
+with cte_TEU as ( --TEU reconstructed at job grain from CALC.v_TMFF_AllItemsWithTEUAllocation's real allocation logic
+			--(container/load-unit TEU split by cargo-volume share across every job sharing the container, plus
+			--virtual containers/vehicles implied by TMFF_SEA/TMFF_ROAD when no real container/load-unit row
+			--exists yet). All four sources UNION ALL'd, one GROUP BY JOB_UNID at the end.
 			select		JOB_UNID, TEU = sum(AllocatedTEU)
 			from		(
 
@@ -123,7 +148,110 @@ with cte_TEU as (
 						) all_teu
 			group by	JOB_UNID
 ),
-cte_AllRows as (
+cte_TMFF_ShipmentId as ( --must see every active TMFF_JOB row sharing a GSHPID, not just the House-dedup
+			--winners, to pick the right canonical clean SHPNO for the group - so this runs on the full
+			--population, same as it always has, and the winners just look the result up by JOB_UNID below.
+			select		  JOB_UNID	=	j.UNID
+						, ShipmentID	=	cast(coalesce(
+													case	when min(shpnoc.clean_SHPNO) over (partition by j.GSHPID) <> max(shpnoc.clean_SHPNO) over (partition by j.GSHPID)
+															then first_value(shpnoc.clean_SHPNO) over (partition by j.GSHPID order by case when shpnoc.clean_SHPNO is null then 999 else 1 end asc, j.CREATEDATE asc)
+														end
+												, shpnoc.clean_SHPNO
+												, 'TMFF|' + j.OWNERID + '|' + cast(j.UNID as varchar)
+												) as varchar(150))
+			from		ODS.TMFF_JOB j
+			outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno
+			cross apply	(select clean_SHPNO = case when replace(shpno.CleanRaw,'0','') = '' then null else shpno.CleanRaw end) shpnoc
+			where		j.SCD_ActiveFlag = 1
+			and			j.SCD_IsDeleted = 0
+			and			j.VOIDDATE is null
+),
+cte_Candidates as ( --cheap: only House/CreateDate/JOB_UNID (all present on the driving row with zero
+			--detail joins), plus whatever's needed to know a row even qualifies at all - the ICOID
+			--business-rule filter and the slave-AWB exclusion on the OPS side. None of the detail joins
+			--(vendor/pieces/consignee/customer/mawb/... ) run here; they're deferred to the winners only.
+			select		  JOB_UNID	=	cast(j.UNID			as varchar(50))
+						, System_BK	=	cast('TMFF'			as varchar(50))
+						, House		=	cast(j.SHPNO		as varchar(50))
+						, CreateDate	=	j.CREATEDATE
+			from		ODS.TMFF_JOB j
+			where		j.SCD_ActiveFlag = 1
+			and			j.SCD_IsDeleted = 0
+			and			j.VOIDDATE is null
+
+			union all
+
+			select		  JOB_UNID	=	cast(a.rowguid_AWB	as varchar(50))
+						, System_BK	=	cast('NORAMOPSDW'	as varchar(50))
+						, House		=	cast(a.HWB			as varchar(50))
+						, CreateDate	=	a.EntryDate
+			from		(
+						select		  *
+									, rn	=	row_number() over (partition by rowguid_AWB order by LastEdit desc)
+						from		ODS.NORAMOPSDW_tblAWB
+						where		AWBID is not null
+						and			SCD_ActiveFlag = 1
+						and			SCD_IsDeleted = 0
+						and			(	coalesce(cast(ETADate as date), cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
+									or	coalesce(cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
+									)
+						) a
+			join		ODS.NORAMOPSDW_tblICO i
+			on			a.rowguid_ICO = i.rowguid_ICO
+			and			i.SCD_ActiveFlag = 1
+			and			i.SCD_IsDeleted = 0
+			left join	( --slave-AWB detection, inlined from CALC.v_NORAMOPSDW_AWB_SlavesAndMasters (COBI-7158) -
+						--single scan + two window-function passes instead of a self-join, see v_Job.sql's
+						--history for why. Runs once here, not again per detail join.
+						select		  Slave_RowGuid_AWB	=	rowguid_AWB
+						from		(
+									select		  rowguid_AWB
+												, ix
+												, IsSlaveShape
+												, HasMasterInPool	=	max(case when IsSlaveShape = 0 and ix = 1 then 1 else 0 end) over (partition by MasterKey)
+									from		(
+												select		  rowguid_AWB
+															, ix			=	row_number() over (partition by RowGuid_AWB order by HWB desc, SCD_UpdateDate desc)
+															, IsSlaveShape	=	case when len(HWB) > 11 and HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][A-Z]%' then 1 else 0 end
+															, MasterKey		=	case	when len(HWB) > 11 and HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][A-Z]%' then left(HWB,11)
+																					when len(HWB) = 11 then HWB
+																					else null
+																				end
+												from		ODS.NORAMOPSDW_tblAWB
+												where		LinkServer = 'TGOPSINTL'
+												and			HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9]%'
+												and			SCD_ActiveFlag = 1
+												and			SCD_IsDeleted = 0
+												and			(	coalesce(cast(ETADate as date), cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
+															or	coalesce(cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
+															)
+												) t0
+									) t1
+						where		ix = 1
+						and			IsSlaveShape = 1
+						and			HasMasterInPool = 1
+						) sam
+			on			sam.Slave_RowGuid_AWB = a.rowguid_AWB
+			where		i.ICOID not in ('9999','8888','CPH99','SHARED','0000', 'BATCH','GOT99')
+			and			i.ICOID not like 'TC%'
+			and			i.ICOID not like 'CN%'
+			and			a.rn = 1
+			and			sam.Slave_RowGuid_AWB is null
+),
+cte_Winners as ( --the 1 JOB_UNID per unique shipment (System_BK, House) that survives the dedup - earliest
+			--CreateDate wins, JOB_UNID as a deterministic tie-break. NULL House falls back to JOB_UNID so
+			--it's never bucketed with other NULL-House rows.
+			select		JOB_UNID, System_BK
+			from		(
+						select		  JOB_UNID, System_BK
+									, rn	=	row_number() over (
+														partition by	System_BK, coalesce(House, JOB_UNID)
+														order by		CreateDate asc, JOB_UNID asc
+													)
+						from		cte_Candidates
+						) x
+			where		rn = 1
+)
 select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
 			, System_BK					=	cast('TMFF'									as varchar(50))
 			, Branch					=	cast(j.OWNERID								as varchar(50))
@@ -177,13 +305,7 @@ select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
 			, PORETDDate				=	j.PORETDDATE
 			, ServiceLevel				=	cast(jo.SERVICELEVEL											as varchar(50))
 			, ServiceType				=	cast(jo.SERVICETYPE												as varchar(50))
-			, ShipmentID				=	cast(coalesce(
-														case	when min(shpnoc.clean_SHPNO) over (partition by j.GSHPID) <> max(shpnoc.clean_SHPNO) over (partition by j.GSHPID)
-																then first_value(shpnoc.clean_SHPNO) over (partition by j.GSHPID order by case when shpnoc.clean_SHPNO is null then 999 else 1 end asc, j.CREATEDATE asc)
-															end
-													, shpnoc.clean_SHPNO
-													, 'TMFF|' + j.OWNERID + '|' + cast(j.UNID as varchar)
-													) as varchar(150))
+			, ShipmentID				=	sid.ShipmentID
 			, ShipperID					=	cast(j.PARTYID_SHPR												as varchar(50))
 			, ShipperName				=	cast(j.SHPRNAME													as varchar(100))
 			, ShipperAddress1			=	cast(jo.SHPRADDR1												as varchar(50))
@@ -204,6 +326,11 @@ select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
 			, Weight_UT					=	cast(j.TOTGWGT_UT												as varchar(50))
 			, UniqueRecordKey			=	utilities.ufn_GetHashedUID('TMFF', cast(j.UNID as varchar), default, default, default)
 from		ODS.TMFF_JOB j
+join		cte_Winners w
+on			w.System_BK = 'TMFF'
+and			w.JOB_UNID = cast(j.UNID as varchar(50))
+left join	cte_TMFF_ShipmentId sid
+on			sid.JOB_UNID = j.UNID
 left join	(
 			select		  JOB_UNID
 						, ClosingDate	=	min(STATUSDATE)
@@ -269,8 +396,6 @@ left join	(
 			group by	JOB_UNID
 			) jro
 on			jro.JOB_UNID = j.UNID
-outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno
-cross apply	(select clean_SHPNO = case when replace(shpno.CleanRaw,'0','') = '' then null else shpno.CleanRaw end) shpnoc
 outer apply	(
 			select		MasterCode	=	case	when j.SHPTYPE = 'D'
 												then coalesce(sea.MBLNO, j.SHPNO)
@@ -392,6 +517,7 @@ select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
 			, Weight					=	a.TotalWeight
 			, Weight_UT					=	cast(a.TotalDimWeight											as varchar(50))
 			, UniqueRecordKey			=	utilities.ufn_GetHashedUID('NORAMOPSDW', coalesce(cast(a.rowguid_AWB as varchar(500)), '¤NULL¤'), default, default, default)
+
 from		(
 			select		  *
 						, rn	=	row_number() over (partition by rowguid_AWB order by LastEdit desc)
@@ -403,6 +529,9 @@ from		(
 						or	coalesce(cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
 						)
 			) a
+join		cte_Winners w
+on			w.System_BK = 'NORAMOPSDW'
+and			w.JOB_UNID = cast(a.rowguid_AWB as varchar(50))
 join		ODS.NORAMOPSDW_tblICO i
 on			a.rowguid_ICO = i.rowguid_ICO
 and			i.SCD_ActiveFlag = 1
@@ -579,64 +708,5 @@ left join	ODS.NORAMOPSDW_tblAWBShipper shp
 on			a.Rowguid_AWB = shp.Rowguid_AWB
 and			shp.SCD_ActiveFlag = 1
 and			shp.SCD_IsDeleted = 0
-left join	(
-			select		  Slave_RowGuid_AWB	=	rowguid_AWB
-			from		(
-						select		  rowguid_AWB
-									, ix
-									, IsSlaveShape
-									, HasMasterInPool	=	max(case when IsSlaveShape = 0 and ix = 1 then 1 else 0 end) over (partition by MasterKey)
-						from		(
-									select		  rowguid_AWB
-												, ix			=	row_number() over (partition by RowGuid_AWB order by HWB desc, SCD_UpdateDate desc)
-												, IsSlaveShape	=	case when len(HWB) > 11 and HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][A-Z]%' then 1 else 0 end
-												, MasterKey		=	case	when len(HWB) > 11 and HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][A-Z]%' then left(HWB,11)
-																		when len(HWB) = 11 then HWB
-																		else null
-																	end
-									from		ODS.NORAMOPSDW_tblAWB
-									where		LinkServer = 'TGOPSINTL'
-									and			HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9]%'
-									and			SCD_ActiveFlag = 1
-									and			SCD_IsDeleted = 0
-									and			(	coalesce(cast(ETADate as date), cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
-												or	coalesce(cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
-												)
-									) t0
-						) t1
-			where		ix = 1
-			and			IsSlaveShape = 1
-			and			HasMasterInPool = 1
-			) sam
-on			sam.Slave_RowGuid_AWB = a.rowguid_AWB
-where		i.ICOID not in ('9999','8888','CPH99','SHARED','0000', 'BATCH','GOT99')
-and			i.ICOID not like 'TC%'
-and			i.ICOID not like 'CN%'
-and			a.rn = 1
-and			sam.Slave_RowGuid_AWB is null
-)
-select		JOB_UNID, System_BK, Branch, CarrierCode, CarrierName, ChargeableWeight, ClosingDate
-			, ConsigneeID, ConsigneeName, ConsigneeAddress1, ConsigneeAddress2, ConsigneeAddress3, ConsigneeAddress4
-			, ConsigneeCity, ConsigneeState, ConsigneePostalCode, ConsigneeCountryCode
-			, CreateDate
-			, CustomerID, CustomerName, CustomerCode, CustomerContact, CustomerPhone
-			, CustomerAddress1, CustomerAddress2, CustomerAddress3, CustomerAddress4
-			, CustomerCity, CustomerState, CustomerPostalCode, CustomerCountryCode
-			, DeliveryLocationCode, Department, FinalDestinationLocationCode, FinalDestinationDate
-			, FlightNumber, FreightDescription, House, JobNo, Master, ModeOfTransport, Pieces
-			, POD, PODETADate, POL, POLETDDate, POR, PORETDDate
-			, ServiceLevel, ServiceType, ShipmentID
-			, ShipperID, ShipperName, ShipperAddress1, ShipperAddress2, ShipperAddress3, ShipperAddress4
-			, ShipperCity, ShipperState, ShipperPostalCode, ShipperCountryCode
-			, TEU, TSP, VesselName, VIA, Volume, VoyageNo, Weight, Weight_UT
-			, UniqueRecordKey
-from		(
-			select		  *
-						, rn	=	row_number() over (
-											partition by	System_BK, coalesce(House, JOB_UNID)
-											order by		CreateDate asc, JOB_UNID asc
-										)
-			from		cte_AllRows
-			) dedup
-where		rn = 1
+where		a.rn = 1
 GO
