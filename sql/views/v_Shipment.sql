@@ -5,55 +5,9 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
--- =====================================================================================================
--- View:    Reports.v_Shipment
--- Purpose: 1 row = 1 UNIQUE SHIPMENT, covering the "Shipment" tab of UP_Data_Model_1108.xlsx.
---
--- Grain: cte_AllRows below is 1 row per JOB (TMFF) or 1 AWB (NORAMOPSDW/OPS) - the same grain as
--- Reports.v_Job. On top of that, this view deduplicates to 1 row per unique shipment by House number
--- (TMFF House = SHPNO, OPS House = HWB): when several JOB/AWB rows share a House, the one with the
--- earliest CreateDate wins (JOB_UNID as a deterministic tie-break for same-timestamp rows), and ALL of
--- its columns are carried through as-is - a representative-row pick, not an aggregation of
--- Weight/Volume/Pieces/etc. across the group. Dedup is scoped separately per source system
--- (System_BK) - a TMFF SHPNO and an OPS HWB that happen to share the same text are NOT treated as the
--- same shipment, since they're two unrelated numbering schemes (confirmed with user). Rows with a NULL
--- House are never collapsed into each other: the partition key falls back to JOB_UNID (always unique)
--- for those, since ROW_NUMBER() OVER (PARTITION BY ...) would otherwise treat every NULL-House row as
--- one shared group, same as GROUP BY does.
---
--- cte_AllRows itself is a structural clone of Reports.v_Job: the Shipment tab lists the exact same 68
--- field names as the Job tab in this workbook (verified field-by-field - zero difference either way),
--- the same source entities/columns, and even the same wording on the trickier fields (CarrierCode's
--- IATA/MasterCode fallback, ChargeableWeight's FCL vs non-FCL split, TEU) - so it reuses every fix and
--- optimization already made for v_Job rather than re-deriving them:
---   * Consignee/Shipper come from the snapshot fields on JOB/JOBOTHER (TMFF), not FMPARTY - same
---     mislabeled-column bug in v_TMFF_Shipment this was built to avoid (see docs/HANDOFF_SUMMARY.md).
---     Customer stays on FMPARTY/FMPARTYADDR (no snapshot exists for it).
---   * OPS Consignee/Shipper come from tblAWBConsignee/tblAWBShipper directly (already correct there).
---   * ShipmentID / TEU / the OPS slave-AWB exclusion all reuse the same window-function-based logic
---     (no self-joins, no repeated table scans, no separate CTEs re-scanning the driving table) worked
---     out for v_Job - see that file's history for why each is shaped the way it is.
---   * Every join key / id column is cast to varchar so TMFF's numeric UNID and OPS's uniqueidentifier
---     rowguid_AWB don't clash in the UNION ALL.
---
--- Only real field difference from v_Job: this workbook renames two fields - Delivery ->
--- DeliveryLocationCode, FinalDestination -> FinalDestinationLocationCode (same source columns, just
--- renamed output). Note the Job tab in this same (newer) workbook already uses these same renamed
--- names too - v_Job.sql was built from the older UP_Data_Model_2907__copy.xlsx and still says
--- Delivery/FinalDestination; worth checking whether it should be renamed to match this newer naming
--- for consistency.
---
--- See docs/ASSUMPTIONS_Shipment.md for the dedup design decisions, docs/ASSUMPTIONS.md for the full
--- list of fields taken from the Excel mapping without DDL confirmation, and docs/HANDOFF_SUMMARY.md for
--- the original Consignee/Shipper snapshot-vs-party-master background.
--- =====================================================================================================
 create view [Reports].[v_Shipment]
 as
-with cte_TEU as ( --TEU reconstructed at job grain from CALC.v_TMFF_AllItemsWithTEUAllocation's real allocation logic
-			--(container/load-unit TEU split by cargo-volume share across every job sharing the container, plus
-			--virtual containers/vehicles implied by TMFF_SEA/TMFF_ROAD when no real container/load-unit row
-			--exists yet) - see v_Job.sql's history for the full derivation. All four sources UNION ALL'd, one
-			--GROUP BY JOB_UNID at the end.
+with cte_TEU as (
 			select		JOB_UNID, TEU = sum(AllocatedTEU)
 			from		(
 
@@ -169,8 +123,7 @@ with cte_TEU as ( --TEU reconstructed at job grain from CALC.v_TMFF_AllItemsWith
 						) all_teu
 			group by	JOB_UNID
 ),
-cte_AllRows as ( --1 row per JOB (TMFF) / AWB (OPS), same grain as Reports.v_Job - deduplicated to 1 row
-				 --per unique shipment below
+cte_AllRows as (
 select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
 			, System_BK					=	cast('TMFF'									as varchar(50))
 			, Branch					=	cast(j.OWNERID								as varchar(50))
@@ -250,14 +203,7 @@ select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
 			, Weight					=	j.TOTGWGT
 			, Weight_UT					=	cast(j.TOTGWGT_UT												as varchar(50))
 			, UniqueRecordKey			=	utilities.ufn_GetHashedUID('TMFF', cast(j.UNID as varchar), default, default, default)
-			, DataAgeHOT				=	jo.SCD_UpdateDate
-			, DataAgeCOLD				=	(select max(v) from (values (j.SCD_UpdateDate), (jo.SCD_UpdateDate), (custp.SCD_UpdateDate), (custpa.SCD_UpdateDate)) x(v))
-			, RecordChangeDateTime		=	getdate()
 from		ODS.TMFF_JOB j
-outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno --same GlobalShipmentId_BK cleaning as CALC.v_TMFF_Job_GlobalShipmentId_Weight_Volume_Company;
-																					  --folded into the main scan of ODS.TMFF_JOB instead of a separate cte_ShipmentId
-																					  --(that used to re-scan the whole table + re-call this UDF once per row all over again)
-cross apply	(select clean_SHPNO = case when replace(shpno.CleanRaw,'0','') = '' then null else shpno.CleanRaw end) shpnoc
 left join	(
 			select		  JOB_UNID
 						, ClosingDate	=	min(STATUSDATE)
@@ -323,6 +269,8 @@ left join	(
 			group by	JOB_UNID
 			) jro
 on			jro.JOB_UNID = j.UNID
+outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno
+cross apply	(select clean_SHPNO = case when replace(shpno.CleanRaw,'0','') = '' then null else shpno.CleanRaw end) shpnoc
 outer apply	(
 			select		MasterCode	=	case	when j.SHPTYPE = 'D'
 												then coalesce(sea.MBLNO, j.SHPNO)
@@ -444,16 +392,6 @@ select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
 			, Weight					=	a.TotalWeight
 			, Weight_UT					=	cast(a.TotalDimWeight											as varchar(50))
 			, UniqueRecordKey			=	utilities.ufn_GetHashedUID('NORAMOPSDW', coalesce(cast(a.rowguid_AWB as varchar(500)), '¤NULL¤'), default, default, default)
-			, DataAgeHOT				=	a.SCD_UpdateDate
-			, DataAgeCOLD				=	(
-											select	max(v)
-											from	(
-													values	  (a.SCD_UpdateDate), (con.SCD_UpdateDate), (shp.SCD_UpdateDate)
-															, (i.SCD_UpdateDate), (intl.SCD_UpdateDate), (lc.SCD_UpdateDate)
-													) x (v)
-											)
-			, RecordChangeDateTime		=	getdate()
-
 from		(
 			select		  *
 						, rn	=	row_number() over (partition by rowguid_AWB order by LastEdit desc)
@@ -641,14 +579,7 @@ left join	ODS.NORAMOPSDW_tblAWBShipper shp
 on			a.Rowguid_AWB = shp.Rowguid_AWB
 and			shp.SCD_ActiveFlag = 1
 and			shp.SCD_IsDeleted = 0
-left join	( --slave-AWB detection, inlined from CALC.v_NORAMOPSDW_AWB_SlavesAndMasters (COBI-7158: NORAMOPSDW
-			--duplicates some AWB rows under a suffixed HWB - "12345-67890A" is a duplicate/"slave" of master
-			--"12345-67890"). Rewritten as a single scan of the filtered tblAWB pool + two window-function passes
-			--instead of a self-join (the self-join version scanned this same filtered pool twice - LIKE
-			--patterns using character classes like '[0-9]' can't use an index seek in SQL Server, so each scan
-			--was a full scan of this table). Each row gets a MasterKey (its own HWB if master-shaped, or the
-			--HWB it would be a slave of if slave-shaped); MAX(...) OVER(PARTITION BY MasterKey) then checks
-			--whether a live (ix=1), master-shaped row with that same key exists anywhere in the pool.
+left join	(
 			select		  Slave_RowGuid_AWB	=	rowguid_AWB
 			from		(
 						select		  rowguid_AWB
@@ -682,7 +613,7 @@ where		i.ICOID not in ('9999','8888','CPH99','SHARED','0000', 'BATCH','GOT99')
 and			i.ICOID not like 'TC%'
 and			i.ICOID not like 'CN%'
 and			a.rn = 1
-and			sam.Slave_RowGuid_AWB is null --filter out slaves
+and			sam.Slave_RowGuid_AWB is null
 )
 select		JOB_UNID, System_BK, Branch, CarrierCode, CarrierName, ChargeableWeight, ClosingDate
 			, ConsigneeID, ConsigneeName, ConsigneeAddress1, ConsigneeAddress2, ConsigneeAddress3, ConsigneeAddress4
@@ -698,9 +629,8 @@ select		JOB_UNID, System_BK, Branch, CarrierCode, CarrierName, ChargeableWeight,
 			, ShipperID, ShipperName, ShipperAddress1, ShipperAddress2, ShipperAddress3, ShipperAddress4
 			, ShipperCity, ShipperState, ShipperPostalCode, ShipperCountryCode
 			, TEU, TSP, VesselName, VIA, Volume, VoyageNo, Weight, Weight_UT
-			, UniqueRecordKey, DataAgeHOT, DataAgeCOLD, RecordChangeDateTime
-from		( --dedup to 1 row per unique shipment by House, scoped per system; NULL House falls back to
-			 --JOB_UNID so it never gets bucketed together with other NULL-House rows
+			, UniqueRecordKey
+from		(
 			select		  *
 						, rn	=	row_number() over (
 											partition by	System_BK, coalesce(House, JOB_UNID)
