@@ -21,7 +21,7 @@ already does. So rather than re-deriving everything, `v_Shipment.sql` reuses `v_
 - Every join key / id column cast to varchar for the same UNID (numeric) vs rowguid_AWB
   (uniqueidentifier) reason as v_Job.
 
-Column-by-column parity between the two UNION ALL branches was verified mechanically (72 output columns,
+Column-by-column parity between the two UNION ALL branches was verified mechanically (70 output columns,
 same names, same order on both sides) before committing.
 
 ## The only actual difference from v_Job
@@ -43,18 +43,15 @@ deduplicated by House number - when several JOB/AWB rows share a House, the one 
 aggregation across the group).
 
 This was first built as a second wrapper view (`Reports.v_Shipment_Unique`, selecting from
-`Reports.v_Shipment`), but the user corrected that to a single self-contained view, matching how
-`Reports.v_Job` is structured: one `CREATE VIEW`, with the 1-row-per-JOB/AWB logic as an internal CTE
-(`cte_AllRows`) and the dedup as the outer query, not two separate views. `v_Shipment.sql` now has that
-shape: `cte_TEU` -> `cte_AllRows` (1 row per JOB/AWB, the old grain) -> outer `SELECT ... WHERE rn = 1`
-(1 row per unique shipment).
+`Reports.v_Shipment`), then merged into one self-contained view (`cte_TEU` -> `cte_AllRows` -> outer
+dedup), matching how `Reports.v_Job` is structured. It was then restructured again for performance (see
+next section) - the dedup now happens *before* the detail joins instead of after.
 
 Two design decisions were confirmed with the user rather than assumed:
 - **Dedup scope**: within each source system separately (TMFF `SHPNO` vs OPS `HWB` are two unrelated
   numbering schemes - a text coincidence between them should not merge two unrelated shipments). This
   needed a `System_BK` column (`'TMFF'` / `'NORAMOPSDW'`, same convention as the real
-  `v_TMFF_Shipment`/`v_NORAMOPSDW_Shipment`) added to `cte_AllRows`, since nothing previously exposed
-  which branch a row came from.
+  `v_TMFF_Shipment`/`v_NORAMOPSDW_Shipment`).
 - **"First job" tie-break**: earliest `CreateDate`, with `JOB_UNID` as a deterministic secondary
   tie-break for same-timestamp rows.
 
@@ -62,6 +59,37 @@ Rows with a `NULL` House are not collapsed into each other - the partition key f
 (always unique) for those, so a `NULL` House doesn't accidentally bucket unrelated shipments together
 (the naive `PARTITION BY House` would have put every `NULL`-House row in one shared group, since
 `ROW_NUMBER() OVER (PARTITION BY ...)` treats `NULL` as a single group like `GROUP BY` does).
+
+## Pick-winners-first restructuring (performance)
+
+The original single-view shape built every output column for every JOB/AWB (the full detail-join
+fan-out: `JOBOTHER`, the `FMPARTY`/`FMPARTYADDR` chain, `AIR`/`SEA`/`JOBROUTE`, `TEU` on TMFF; vendor,
+pieces, consignee, customer, `tblMAWBOcean`/`tblMAWB`, department, shipper, etc. on OPS) and only
+*then* deduplicated down to unique shipments - meaning most of that join work ran for rows that got
+thrown away by the dedup a moment later.
+
+`v_Shipment.sql` now picks the winning `JOB_UNID` per unique shipment *first*, cheaply, and only runs
+the detail joins for the winners:
+- `cte_Candidates`: just `House`/`CreateDate`/`JOB_UNID`/`System_BK` - all sit directly on the driving
+  row (`TMFF_JOB.SHPNO`/`CREATEDATE`/`UNID`, `tblAWB.HWB`/`EntryDate`/`rowguid_AWB`), plus whatever's
+  needed to know a row qualifies at all (the ICOID business-rule filter and the slave-AWB exclusion on
+  the OPS side - both moved here, so they now run once instead of once per detail join).
+- `cte_Winners`: the same `ROW_NUMBER() OVER (PARTITION BY System_BK, COALESCE(House, JOB_UNID) ORDER BY
+  CreateDate ASC, JOB_UNID ASC) = 1` dedup as before, but computed over the cheap candidate rows.
+- The two detail branches (TMFF/OPS) `JOIN` onto `cte_Winners` on `System_BK` + `JOB_UNID`, so the full
+  join fan-out only executes for the rows that actually survive to the output.
+
+**One exception**: TMFF's `ShipmentID` is computed by a window function (`MIN`/`MAX`/`FIRST_VALUE`)
+partitioned by `GSHPID` across *every* active `TMFF_JOB` row sharing that group, to pick a canonical
+clean `SHPNO` value - not just the rows that happen to win the House-dedup. Restricting to winners before
+computing it could hide a sibling row the window needs to see and change the result. So it's computed
+once, up front, over the full active population in `cte_TMFF_ShipmentId` (same cost as before - this was
+always the expensive part, per the earlier UDF/scalar-function performance work) and looked up by
+`JOB_UNID` for the winners. OPS's `ShipmentID` has no such cross-row dependency (pure function of that
+AWB's own joined fields), so it stays computed inline in the OPS detail branch.
+
+Net effect: the detail join fan-out, and the non-seekable `LIKE`-based OPS slave-AWB scan, now run once
+per unique shipment instead of once per underlying JOB/AWB.
 
 ## Not used for this task, but reviewed (per the user's request)
 
