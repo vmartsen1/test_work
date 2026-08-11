@@ -7,13 +7,24 @@ GO
 
 -- =====================================================================================================
 -- View:    Reports.v_Shipment
--- Purpose: 1 row = 1 JOB (TMFF) or 1 AWB (NORAMOPSDW/OPS), UNION ALL'd into one table, covering the
---          "Shipment" tab of UP_Data_Model_1108.xlsx.
+-- Purpose: 1 row = 1 UNIQUE SHIPMENT, covering the "Shipment" tab of UP_Data_Model_1108.xlsx.
 --
--- This is a structural clone of Reports.v_Job: the Shipment tab lists the exact same 68 field names as
--- the Job tab in this workbook (verified field-by-field - zero difference either way), the same source
--- entities/columns, and even the same wording on the trickier fields (CarrierCode's IATA/MasterCode
--- fallback, ChargeableWeight's FCL vs non-FCL split, TEU) - so this view reuses every fix and
+-- Grain: cte_AllRows below is 1 row per JOB (TMFF) or 1 AWB (NORAMOPSDW/OPS) - the same grain as
+-- Reports.v_Job. On top of that, this view deduplicates to 1 row per unique shipment by House number
+-- (TMFF House = SHPNO, OPS House = HWB): when several JOB/AWB rows share a House, the one with the
+-- earliest CreateDate wins (JOB_UNID as a deterministic tie-break for same-timestamp rows), and ALL of
+-- its columns are carried through as-is - a representative-row pick, not an aggregation of
+-- Weight/Volume/Pieces/etc. across the group. Dedup is scoped separately per source system
+-- (System_BK) - a TMFF SHPNO and an OPS HWB that happen to share the same text are NOT treated as the
+-- same shipment, since they're two unrelated numbering schemes (confirmed with user). Rows with a NULL
+-- House are never collapsed into each other: the partition key falls back to JOB_UNID (always unique)
+-- for those, since ROW_NUMBER() OVER (PARTITION BY ...) would otherwise treat every NULL-House row as
+-- one shared group, same as GROUP BY does.
+--
+-- cte_AllRows itself is a structural clone of Reports.v_Job: the Shipment tab lists the exact same 68
+-- field names as the Job tab in this workbook (verified field-by-field - zero difference either way),
+-- the same source entities/columns, and even the same wording on the trickier fields (CarrierCode's
+-- IATA/MasterCode fallback, ChargeableWeight's FCL vs non-FCL split, TEU) - so it reuses every fix and
 -- optimization already made for v_Job rather than re-deriving them:
 --   * Consignee/Shipper come from the snapshot fields on JOB/JOBOTHER (TMFF), not FMPARTY - same
 --     mislabeled-column bug in v_TMFF_Shipment this was built to avoid (see docs/HANDOFF_SUMMARY.md).
@@ -25,15 +36,16 @@ GO
 --   * Every join key / id column is cast to varchar so TMFF's numeric UNID and OPS's uniqueidentifier
 --     rowguid_AWB don't clash in the UNION ALL.
 --
--- Only real difference from v_Job: this workbook renames two fields - Delivery -> DeliveryLocationCode,
--- FinalDestination -> FinalDestinationLocationCode (same source columns, just renamed output). Note the
--- Job tab in this same (newer) workbook already uses these same renamed names too - v_Job.sql was built
--- from the older UP_Data_Model_2907__copy.xlsx and still says Delivery/FinalDestination; worth checking
--- whether it should be renamed to match this newer naming for consistency.
+-- Only real field difference from v_Job: this workbook renames two fields - Delivery ->
+-- DeliveryLocationCode, FinalDestination -> FinalDestinationLocationCode (same source columns, just
+-- renamed output). Note the Job tab in this same (newer) workbook already uses these same renamed
+-- names too - v_Job.sql was built from the older UP_Data_Model_2907__copy.xlsx and still says
+-- Delivery/FinalDestination; worth checking whether it should be renamed to match this newer naming
+-- for consistency.
 --
--- See docs/ASSUMPTIONS.md for the full list of fields taken from the Excel mapping without DDL
--- confirmation, and docs/HANDOFF_SUMMARY.md for the original Consignee/Shipper snapshot-vs-party-master
--- background.
+-- See docs/ASSUMPTIONS_Shipment.md for the dedup design decisions, docs/ASSUMPTIONS.md for the full
+-- list of fields taken from the Excel mapping without DDL confirmation, and docs/HANDOFF_SUMMARY.md for
+-- the original Consignee/Shipper snapshot-vs-party-master background.
 -- =====================================================================================================
 create view [Reports].[v_Shipment]
 as
@@ -156,7 +168,9 @@ with cte_TEU as ( --TEU reconstructed at job grain from CALC.v_TMFF_AllItemsWith
 						and			v.qty > 0
 						) all_teu
 			group by	JOB_UNID
-)
+),
+cte_AllRows as ( --1 row per JOB (TMFF) / AWB (OPS), same grain as Reports.v_Job - deduplicated to 1 row
+				 --per unique shipment below
 select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
 			, System_BK					=	cast('TMFF'									as varchar(50))
 			, Branch					=	cast(j.OWNERID								as varchar(50))
@@ -339,7 +353,6 @@ on			teu.JOB_UNID = j.UNID
 where		j.SCD_ActiveFlag = 1
 and			j.SCD_IsDeleted = 0
 and			j.VOIDDATE is null
-
 
 
 union all
@@ -670,4 +683,30 @@ and			i.ICOID not like 'TC%'
 and			i.ICOID not like 'CN%'
 and			a.rn = 1
 and			sam.Slave_RowGuid_AWB is null --filter out slaves
+)
+select		JOB_UNID, System_BK, Branch, CarrierCode, CarrierName, ChargeableWeight, ClosingDate
+			, ConsigneeID, ConsigneeName, ConsigneeAddress1, ConsigneeAddress2, ConsigneeAddress3, ConsigneeAddress4
+			, ConsigneeCity, ConsigneeState, ConsigneePostalCode, ConsigneeCountryCode
+			, CreateDate
+			, CustomerID, CustomerName, CustomerCode, CustomerContact, CustomerPhone
+			, CustomerAddress1, CustomerAddress2, CustomerAddress3, CustomerAddress4
+			, CustomerCity, CustomerState, CustomerPostalCode, CustomerCountryCode
+			, DeliveryLocationCode, Department, FinalDestinationLocationCode, FinalDestinationDate
+			, FlightNumber, FreightDescription, House, JobNo, Master, ModeOfTransport, Pieces
+			, POD, PODETADate, POL, POLETDDate, POR, PORETDDate
+			, ServiceLevel, ServiceType, ShipmentID
+			, ShipperID, ShipperName, ShipperAddress1, ShipperAddress2, ShipperAddress3, ShipperAddress4
+			, ShipperCity, ShipperState, ShipperPostalCode, ShipperCountryCode
+			, TEU, TSP, VesselName, VIA, Volume, VoyageNo, Weight, Weight_UT
+			, UniqueRecordKey, DataAgeHOT, DataAgeCOLD, RecordChangeDateTime
+from		( --dedup to 1 row per unique shipment by House, scoped per system; NULL House falls back to
+			 --JOB_UNID so it never gets bucketed together with other NULL-House rows
+			select		  *
+						, rn	=	row_number() over (
+											partition by	System_BK, coalesce(House, JOB_UNID)
+											order by		CreateDate asc, JOB_UNID asc
+										)
+			from		cte_AllRows
+			) dedup
+where		rn = 1
 GO

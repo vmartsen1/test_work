@@ -35,19 +35,26 @@ Two fields are renamed in this (newer) workbook vs. the one `v_Job.sql` was buil
 `Delivery`/`FinalDestination` (built from the older workbook). Worth deciding whether to rename those
 two columns in `v_Job.sql` to match, for consistency between the two views.
 
-## Reports.v_Shipment_Unique (new requirement, separate view)
+## Unique-shipment dedup (merged into this same view)
 
-Business requirement changed mid-task: `Reports.v_Shipment` should stay 1 row per JOB/AWB, but a
-**separate** view should expose 1 row per *unique* shipment, deduplicated by House number - when
-several JOB/AWB rows share a House, the one with the earliest `CreateDate` wins and all of its columns
-are carried through as-is (representative-row pick, not aggregation across the group).
+Business requirement changed mid-task: `Reports.v_Shipment` should expose 1 row per *unique* shipment,
+deduplicated by House number - when several JOB/AWB rows share a House, the one with the earliest
+`CreateDate` wins and all of its columns are carried through as-is (representative-row pick, not
+aggregation across the group).
+
+This was first built as a second wrapper view (`Reports.v_Shipment_Unique`, selecting from
+`Reports.v_Shipment`), but the user corrected that to a single self-contained view, matching how
+`Reports.v_Job` is structured: one `CREATE VIEW`, with the 1-row-per-JOB/AWB logic as an internal CTE
+(`cte_AllRows`) and the dedup as the outer query, not two separate views. `v_Shipment.sql` now has that
+shape: `cte_TEU` -> `cte_AllRows` (1 row per JOB/AWB, the old grain) -> outer `SELECT ... WHERE rn = 1`
+(1 row per unique shipment).
 
 Two design decisions were confirmed with the user rather than assumed:
 - **Dedup scope**: within each source system separately (TMFF `SHPNO` vs OPS `HWB` are two unrelated
   numbering schemes - a text coincidence between them should not merge two unrelated shipments). This
   needed a `System_BK` column (`'TMFF'` / `'NORAMOPSDW'`, same convention as the real
-  `v_TMFF_Shipment`/`v_NORAMOPSDW_Shipment`) added to `v_Shipment.sql` itself, since it didn't
-  previously expose which branch a row came from.
+  `v_TMFF_Shipment`/`v_NORAMOPSDW_Shipment`) added to `cte_AllRows`, since nothing previously exposed
+  which branch a row came from.
 - **"First job" tie-break**: earliest `CreateDate`, with `JOB_UNID` as a deterministic secondary
   tie-break for same-timestamp rows.
 
