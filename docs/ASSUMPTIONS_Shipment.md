@@ -35,6 +35,27 @@ Two fields are renamed in this (newer) workbook vs. the one `v_Job.sql` was buil
 `Delivery`/`FinalDestination` (built from the older workbook). Worth deciding whether to rename those
 two columns in `v_Job.sql` to match, for consistency between the two views.
 
+## Reports.v_Shipment_Unique (new requirement, separate view)
+
+Business requirement changed mid-task: `Reports.v_Shipment` should stay 1 row per JOB/AWB, but a
+**separate** view should expose 1 row per *unique* shipment, deduplicated by House number - when
+several JOB/AWB rows share a House, the one with the earliest `CreateDate` wins and all of its columns
+are carried through as-is (representative-row pick, not aggregation across the group).
+
+Two design decisions were confirmed with the user rather than assumed:
+- **Dedup scope**: within each source system separately (TMFF `SHPNO` vs OPS `HWB` are two unrelated
+  numbering schemes - a text coincidence between them should not merge two unrelated shipments). This
+  needed a `System_BK` column (`'TMFF'` / `'NORAMOPSDW'`, same convention as the real
+  `v_TMFF_Shipment`/`v_NORAMOPSDW_Shipment`) added to `v_Shipment.sql` itself, since it didn't
+  previously expose which branch a row came from.
+- **"First job" tie-break**: earliest `CreateDate`, with `JOB_UNID` as a deterministic secondary
+  tie-break for same-timestamp rows.
+
+Rows with a `NULL` House are not collapsed into each other - the partition key falls back to `JOB_UNID`
+(always unique) for those, so a `NULL` House doesn't accidentally bucket unrelated shipments together
+(the naive `PARTITION BY House` would have put every `NULL`-House row in one shared group, since
+`ROW_NUMBER() OVER (PARTITION BY ...)` treats `NULL` as a single group like `GROUP BY` does).
+
 ## Not used for this task, but reviewed (per the user's request)
 
 - `sql/reference/InvoiceDetails.sql` (uploaded alongside this task) - a client-authored view unioning

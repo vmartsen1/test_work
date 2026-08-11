@@ -158,6 +158,7 @@ with cte_TEU as ( --TEU reconstructed at job grain from CALC.v_TMFF_AllItemsWith
 			group by	JOB_UNID
 )
 select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
+			, System_BK					=	cast('TMFF'									as varchar(50))
 			, Branch					=	cast(j.OWNERID								as varchar(50))
 			, CarrierCode				=	cast(coalesce(j.CARRIERCODE, j.CARRIERID, case tm.TransportMode_BK
 																								 when 'Air' then airm.[2LetterIATA]
@@ -345,6 +346,7 @@ union all
 
 
 select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
+			, System_BK					=	cast('NORAMOPSDW'												as varchar(50))
 			, Branch					=	cast(i.ICOId													as varchar(50))
 			, CarrierCode				=	cast(vnd.VendorNo												as varchar(50))
 			, CarrierName				=	cast(vnd.VendorName												as varchar(100))
