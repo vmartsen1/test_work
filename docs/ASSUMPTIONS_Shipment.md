@@ -70,12 +70,12 @@ thrown away by the dedup a moment later.
 
 `v_Shipment.sql` now picks the winning `JOB_UNID` per unique shipment *first*, cheaply, and only runs
 the detail joins for the winners:
-- `cte_Candidates`: just `House`/`CreateDate`/`JOB_UNID`/`System_BK` - all sit directly on the driving
+- The candidate pool: just `House`/`CreateDate`/`JOB_UNID`/`System_BK` - all sit directly on the driving
   row (`TMFF_JOB.SHPNO`/`CREATEDATE`/`UNID`, `tblAWB.HWB`/`EntryDate`/`rowguid_AWB`), plus whatever's
   needed to know a row qualifies at all (the ICOID business-rule filter and the slave-AWB exclusion on
-  the OPS side - both moved here, so they now run once instead of once per detail join).
+  the OPS side).
 - `cte_Winners`: the same `ROW_NUMBER() OVER (PARTITION BY System_BK, COALESCE(House, JOB_UNID) ORDER BY
-  CreateDate ASC, JOB_UNID ASC) = 1` dedup as before, but computed over the cheap candidate rows.
+  CreateDate ASC, JOB_UNID ASC) = 1` dedup as before, wrapped around the candidate pool.
 - The two detail branches (TMFF/OPS) `JOIN` onto `cte_Winners` on `System_BK` + `JOB_UNID`, so the full
   join fan-out only executes for the rows that actually survive to the output.
 
@@ -83,17 +83,27 @@ the detail joins for the winners:
 partitioned by `GSHPID` across *every* active `TMFF_JOB` row sharing that group, to pick a canonical
 clean `SHPNO` value - not just the rows that happen to win the House-dedup. Restricting to winners before
 computing it could hide a sibling row the window needs to see and change the result. So it's computed
-once, up front, over the full active population in `cte_TMFF_ShipmentId` (same cost as before - this was
-always the expensive part, per the earlier UDF/scalar-function performance work) and looked up by
-`JOB_UNID` for the winners. OPS's `ShipmentID` has no such cross-row dependency (pure function of that
-AWB's own joined fields), so it stays computed inline in the OPS detail branch.
+over the full active population (same cost as before - this was always the expensive part, per the
+earlier UDF/scalar-function performance work), as a derived table `LEFT JOIN`ed by `JOB_UNID`. OPS's
+`ShipmentID` has no such cross-row dependency (pure function of that AWB's own joined fields), so it
+stays computed inline in the OPS detail branch.
 
 Net effect: the detail join fan-out, and the non-seekable `LIKE`-based OPS slave-AWB scan, now run once
 per unique shipment instead of once per underlying JOB/AWB.
 
+## CTE-vs-subquery cleanup
+
+Per the same rule applied to `Reports.v_Job`: a `WITH` CTE earns its name only when it's referenced more
+than once; a CTE used exactly once is just a derived table with a label, so it's inlined at its one use
+site instead. `cte_Winners` is the only remaining named CTE (it's joined from both the TMFF and OPS
+detail branches). The candidate pool, the TEU rollup, and the TMFF `ShipmentID` lookup were each
+previously their own CTE (`cte_Candidates`, `cte_TEU`, `cte_TMFF_ShipmentId`) but are referenced from
+exactly one place, so they're now inline derived tables at that place - same logic, same execution plan
+(SQL Server doesn't materialize CTEs any more than derived tables), just without the extra `WITH` name.
+
 ## Scope filters adopted from InvoiceDetails.sql
 
-Same two filters as added to `Reports.v_Job` (see `docs/ASSUMPTIONS.md`), applied in `cte_Candidates`
+Same two filters as added to `Reports.v_Job` (see `docs/ASSUMPTIONS.md`), applied in the candidate pool
 since they decide whether a row qualifies at all (same place the ICOID/slave-AWB filters already live):
 - TMFF: `join ODS.TMFF_SYCOMPANY syc on syc.OWNERID = j.OWNERID and syc.CTRYCODE = 'US'` - restricts to
   US-company jobs.
