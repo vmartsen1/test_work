@@ -5,28 +5,9 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
--- =====================================================================================================
--- View:    Reports.v_Job
--- Purpose: 1 row = 1 JOB (TMFF) or 1 AWB (NORAMOPSDW/OPS), UNION ALL'd into one table, covering the
---          "Job" tab of UP_Data_Model. Built directly on ODS.* tables only (no CALC.* views), except
---          CarrierCode's CALC.BiRef_AirLineMapping fallback (TMFF branch) - kept intentionally for now,
---          pending a decision on whether it's still needed (see comment at that join).
---
--- Column-by-column type parity across the two UNION ALL branches matters here (it didn't when these
--- were two separate views): every join key / id column is cast to varchar so TMFF's numeric UNID and
--- OPS's uniqueidentifier rowguid_AWB don't clash (SQL Server can't implicitly convert between them).
---
--- See docs/ASSUMPTIONS.md for the full list of fields taken from the Excel mapping without DDL
--- confirmation, and docs/HANDOFF_SUMMARY.md for the original Consignee/Shipper snapshot-vs-party-master
--- background.
--- =====================================================================================================
 alter view [Reports].[v_Job]
 as
-with cte_TEU as ( --TEU reconstructed at job grain from CALC.v_TMFF_AllItemsWithTEUAllocation's real allocation logic
-			--(container/load-unit TEU split by cargo-volume share across every job sharing the container, plus
-			--virtual containers/vehicles implied by TMFF_SEA/TMFF_ROAD when no real container/load-unit row
-			--exists yet) - see commit history for the full derivation. All four sources UNION ALL'd, one
-			--GROUP BY JOB_UNID at the end.
+with cte_TEU as (
 			select		JOB_UNID, TEU = sum(AllocatedTEU)
 			from		(
 
@@ -143,12 +124,13 @@ with cte_TEU as ( --TEU reconstructed at job grain from CALC.v_TMFF_AllItemsWith
 			group by	JOB_UNID
 )
 select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
+			, System_BK					=	cast('TMFF'									as varchar(50))
 			, Branch					=	cast(j.OWNERID								as varchar(50))
 			, CarrierCode				=	cast(coalesce(j.CARRIERCODE, j.CARRIERID, case tm.TransportMode_BK
 																								 when 'Air' then airm.[2LetterIATA]
 																								 when 'Sea' then left(mc.MasterCode, 4)
 																							 end)			as varchar(50))
-			, CarrierName				=	cast(null									as varchar(100))  ---????
+			, CarrierName				=	cast(null									as varchar(100))
 			, ChargeableWeight			=	isnull(j.TOTCWGT,0)
 			, ClosingDate				=	cd.ClosingDate
 			, ConsigneeID				=	cast(coalesce(jp.REALCSGN, jo.PARTYID_CSGNONWB, j.PARTYID_CSGN)	as varchar(50))
@@ -219,14 +201,8 @@ select		  JOB_UNID					=	cast(j.UNID									as varchar(50))
 			, VoyageNo					=	cast(mo.VOYAGE													as varchar(50))
 			, Weight					=	j.TOTGWGT
 			, Weight_UT					=	cast(j.TOTGWGT_UT												as varchar(50))
-			, UniqueRecordKey			=	utilities.ufn_GetHashedUID('TMFF', cast(j.UNID as varchar), default, default, default)
-			, DataAgeHOT				=	jo.SCD_UpdateDate
-			, DataAgeCOLD				=	(select max(v) from (values (j.SCD_UpdateDate), (jo.SCD_UpdateDate), (custp.SCD_UpdateDate), (custpa.SCD_UpdateDate)) x(v))
-			, RecordChangeDateTime		=	getdate()
 from		ODS.TMFF_JOB j
-outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno --same GlobalShipmentId_BK cleaning as CALC.v_TMFF_Job_GlobalShipmentId_Weight_Volume_Company;
-																					  --folded into the main scan of ODS.TMFF_JOB instead of a separate cte_ShipmentId
-																					  --(that used to re-scan the whole table + re-call this UDF once per row all over again)
+outer apply	(select CleanRaw = utilities.ufn_GetCleanGlobalShipmentId(j.SHPNO)) shpno
 cross apply	(select clean_SHPNO = case when replace(shpno.CleanRaw,'0','') = '' then null else shpno.CleanRaw end) shpnoc
 left join	(
 			select		  JOB_UNID
@@ -328,20 +304,17 @@ and			j.SCD_IsDeleted = 0
 and			j.VOIDDATE is null
 
 
-
 union all
 
 
 select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
+			, System_BK					=	cast('OPS'														as varchar(50))
 			, Branch					=	cast(i.ICOId													as varchar(50))
 			, CarrierCode				=	cast(vnd.VendorNo												as varchar(50))
 			, CarrierName				=	cast(vnd.VendorName												as varchar(100))
-
 			, ChargeableWeight			=	cw.ChargeableWeight
-
 			, ClosingDate				=	ar.EntryDate
-
-			, ConsigneeID				=	cast(con.AwbConsigneeID												as varchar(50))	--??
+			, ConsigneeID				=	cast(con.AwbConsigneeID											as varchar(50))
 			, ConsigneeName				=	cast(con.Name													as varchar(100))
 			, ConsigneeAddress1			=	cast(con.Address1												as varchar(50))
 			, ConsigneeAddress2			=	cast(con.Address2												as varchar(50))
@@ -351,9 +324,7 @@ select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
 			, ConsigneeState			=	cast(con.State													as varchar(50))
 			, ConsigneePostalCode		=	cast(con.Zip													as varchar(50))
 			, ConsigneeCountryCode		=	cast(con.Country												as varchar(50))
-
 			, CreateDate				=	a.EntryDate
-
 			, CustomerID				=	cast(lc.SlsPsnID												as varchar(50))
 			, CustomerName				=	cast(lc.CustName												as varchar(100))
 			, CustomerCode				=	cast(lc.CustNo													as varchar(50))
@@ -367,12 +338,10 @@ select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
 			, CustomerState				=	cast(lc.State													as varchar(50))
 			, CustomerPostalCode		=	cast(lc.Zip														as varchar(50))
 			, CustomerCountryCode		=	cast(lc.Country													as varchar(50))
-
 			, Delivery					=	cast(coalesce(a.UltDestCode, mawoc.PlDelvCode, intl.PlDelvCode)	as varchar(50))
 			, Department				=	cast(ld.DeptName												as varchar(100))
 			, FinalDestination			=	cast(coalesce(mawoc.PlDelv, maw.PlDelv)						as varchar(100))
 			, FinalDestinationDate		=	a.ScheduledDelivery
-
 			, FlightNumber				=	cast(maw.FlightNumber											as varchar(50))
 			, FreightDescription		=	cast(piec.FghtDesc												as varchar(500))
 			, House						=	cast(a.HWB														as varchar(50))
@@ -390,12 +359,9 @@ select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
 			, POLETDDate				=	coalesce(a.ETDDate, maw.DepartureDate)
 			, POR						=	cast(coalesce(mawoc.PlAcceptCode, intl.PlAcceptCode)			as varchar(50))
 			, PORETDDate				=	a.DateShip
-
 			, ServiceLevel				=	cast(maw.CarrierService											as varchar(50))
 			, ServiceType				=	cast(mawoc.MoveType												as varchar(50))
-
 			, ShipmentID				=	cast(utilities.ufn_GetCleanGlobalShipmentId(trim(coalesce(calc.HouseNoForGlobalShipment, calc.MasterNoForGlobalShipment, calc.UniqueBookingIdentifier)))	as varchar(150))
-
 			, ShipperID					=	cast(shp.AwbShipperID											as varchar(50))
 			, ShipperName				=	cast(shp.Name													as varchar(100))
 			, ShipperAddress1			=	cast(shp.Address1												as varchar(50))
@@ -406,27 +372,14 @@ select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
 			, ShipperState				=	cast(shp.State													as varchar(50))
 			, ShipperPostalCode			=	cast(shp.Zip													as varchar(50))
 			, ShipperCountryCode		=	cast(shp.Country												as varchar(50))
-
 			, TEU						=	isnull(piec.TEU,0)
 			, TSP						=	cast(null														as varchar(50))
-
 			, VesselName				=	cast(maw.VesselName												as varchar(50))
 			, VIA						=	cast(a.GatewayCode												as varchar(50))
 			, Volume					=	case when piec.CnrtLoad = 'FCL' then cw.ChargeableWeight else a.Volume2 end
 			, VoyageNo					=	cast(maw.VoyageNo												as varchar(50))
 			, Weight					=	a.TotalWeight
 			, Weight_UT					=	cast(a.TotalDimWeight											as varchar(50))
-			, UniqueRecordKey			=	utilities.ufn_GetHashedUID('NORAMOPSDW', coalesce(cast(a.rowguid_AWB as varchar(500)), '¤NULL¤'), default, default, default)
-			, DataAgeHOT				=	a.SCD_UpdateDate
-			, DataAgeCOLD				=	(
-											select	max(v)
-											from	(
-													values	  (a.SCD_UpdateDate), (con.SCD_UpdateDate), (shp.SCD_UpdateDate)
-															, (i.SCD_UpdateDate), (intl.SCD_UpdateDate), (lc.SCD_UpdateDate)
-													) x (v)
-											)
-			, RecordChangeDateTime		=	getdate()
-
 from		(
 			select		  *
 						, rn	=	row_number() over (partition by rowguid_AWB order by LastEdit desc)
@@ -434,7 +387,7 @@ from		(
 			where		AWBID is not null
 			and			SCD_ActiveFlag = 1
 			and			SCD_IsDeleted = 0
-			and			LinkServer = 'TGOPSINTL' --same filter as InvoiceDetails.sql
+			and			LinkServer = 'TGOPSINTL'
 			and			(	coalesce(cast(ETADate as date), cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
 						or	coalesce(cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
 						)
@@ -615,14 +568,7 @@ left join	ODS.NORAMOPSDW_tblAWBShipper shp
 on			a.Rowguid_AWB = shp.Rowguid_AWB
 and			shp.SCD_ActiveFlag = 1
 and			shp.SCD_IsDeleted = 0
-left join	( --slave-AWB detection, inlined from CALC.v_NORAMOPSDW_AWB_SlavesAndMasters (COBI-7158: NORAMOPSDW
-			--duplicates some AWB rows under a suffixed HWB - "12345-67890A" is a duplicate/"slave" of master
-			--"12345-67890"). Rewritten as a single scan of the filtered tblAWB pool + two window-function passes
-			--instead of a self-join (the self-join version scanned this same filtered pool twice - LIKE
-			--patterns using character classes like '[0-9]' can't use an index seek in SQL Server, so each scan
-			--was a full scan of this table). Each row gets a MasterKey (its own HWB if master-shaped, or the
-			--HWB it would be a slave of if slave-shaped); MAX(...) OVER(PARTITION BY MasterKey) then checks
-			--whether a live (ix=1), master-shaped row with that same key exists anywhere in the pool.
+left join	(
 			select		  Slave_RowGuid_AWB	=	rowguid_AWB
 			from		(
 						select		  rowguid_AWB
@@ -656,5 +602,5 @@ where		i.ICOID not in ('9999','8888','CPH99','SHARED','0000', 'BATCH','GOT99')
 and			i.ICOID not like 'TC%'
 and			i.ICOID not like 'CN%'
 and			a.rn = 1
-and			sam.Slave_RowGuid_AWB is null --filter out slaves
+and			sam.Slave_RowGuid_AWB is null
 GO
