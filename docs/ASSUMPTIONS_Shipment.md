@@ -91,6 +91,16 @@ AWB's own joined fields), so it stays computed inline in the OPS detail branch.
 Net effect: the detail join fan-out, and the non-seekable `LIKE`-based OPS slave-AWB scan, now run once
 per unique shipment instead of once per underlying JOB/AWB.
 
+## Scope filters adopted from InvoiceDetails.sql
+
+Same two filters as added to `Reports.v_Job` (see `docs/ASSUMPTIONS.md`), applied in `cte_Candidates`
+since they decide whether a row qualifies at all (same place the ICOID/slave-AWB filters already live):
+- TMFF: `join ODS.TMFF_SYCOMPANY syc on syc.OWNERID = j.OWNERID and syc.CTRYCODE = 'US'` - restricts to
+  US-company jobs.
+- OPS: `LinkServer = 'TGOPSINTL'` added to the main `ODS.NORAMOPSDW_tblAWB` driving subquery's `WHERE`
+  (the slave-AWB-detection subquery already had this filter, but only for itself, not for the main
+  driving row).
+
 ## Not used for this task, but reviewed (per the user's request)
 
 - `sql/reference/InvoiceDetails.sql` (uploaded alongside this task) - a client-authored view unioning

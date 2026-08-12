@@ -164,6 +164,18 @@ looking at the functions themselves.
   slave rows never share a `RowGuid_AWB`, so splitting before vs. after computing `ix` gives the same
   result either way.
 
+## Scope filters adopted from InvoiceDetails.sql
+
+The client-authored `sql/reference/InvoiceDetails.sql` (reviewed for the Shipment task) restricts its
+TMFF branch to US-company jobs (`join ODS.TMFF_SYCOMPANY syc on syc.OWNERID = j.OWNERID and
+syc.CTRYCODE = 'US'`) and its OPS branch to `NORAMOPSDW_tblAWB.LinkServer = 'TGOPSINTL'`. Neither filter
+was previously applied in `Reports.v_Job` (the OPS slave-AWB-detection subquery already had the
+`LinkServer` filter, but only inside that subquery, not on the main driving row). Added both filters -
+TMFF: `join ODS.TMFF_SYCOMPANY syc on syc.OWNERID = j.OWNERID and syc.CTRYCODE = 'US'`; OPS: `LinkServer
+= 'TGOPSINTL'` added to the main `ODS.NORAMOPSDW_tblAWB` driving subquery's `WHERE` - so `Reports.v_Job`
+now scopes to the same US/TGOPSINTL population as invoicing. Same two filters were added to
+`Reports.v_Shipment`'s `cte_Candidates` (see `docs/ASSUMPTIONS_Shipment.md`).
+
 ## Suggested next step
 
 Re-upload `TMFF_OPS.sql` (or just the DDL for `TMFF_JOBINTFEXPDTL`, `NORAMOPSDW_tblAWBConsignee`,

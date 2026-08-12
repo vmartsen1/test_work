@@ -320,6 +320,9 @@ and			mo.SCD_ActiveFlag = 1
 and			mo.SCD_IsDeleted = 0
 left join	cte_TEU teu
 on			teu.JOB_UNID = j.UNID
+join		ODS.TMFF_SYCOMPANY syc --restrict to US-company jobs, same filter as InvoiceDetails.sql
+on			syc.OWNERID = j.OWNERID
+and			syc.CTRYCODE = 'US'
 where		j.SCD_ActiveFlag = 1
 and			j.SCD_IsDeleted = 0
 and			j.VOIDDATE is null
@@ -431,6 +434,7 @@ from		(
 			where		AWBID is not null
 			and			SCD_ActiveFlag = 1
 			and			SCD_IsDeleted = 0
+			and			LinkServer = 'TGOPSINTL' --same filter as InvoiceDetails.sql
 			and			(	coalesce(cast(ETADate as date), cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
 						or	coalesce(cast(DateShip as date), cast(EntryDate as date)) >= '20190101'
 						)
