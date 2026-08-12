@@ -69,15 +69,23 @@ pieces, consignee, customer, `tblMAWBOcean`/`tblMAWB`, department, shipper, etc.
 thrown away by the dedup a moment later.
 
 `v_Shipment.sql` now picks the winning `JOB_UNID` per unique shipment *first*, cheaply, and only runs
-the detail joins for the winners:
-- The candidate pool: just `House`/`CreateDate`/`JOB_UNID`/`System_BK` - all sit directly on the driving
-  row (`TMFF_JOB.SHPNO`/`CREATEDATE`/`UNID`, `tblAWB.HWB`/`EntryDate`/`rowguid_AWB`), plus whatever's
-  needed to know a row qualifies at all (the ICOID business-rule filter and the slave-AWB exclusion on
-  the OPS side).
-- `cte_Winners`: the same `ROW_NUMBER() OVER (PARTITION BY System_BK, COALESCE(House, JOB_UNID) ORDER BY
-  CreateDate ASC, JOB_UNID ASC) = 1` dedup as before, wrapped around the candidate pool.
-- The two detail branches (TMFF/OPS) `JOIN` onto `cte_Winners` on `System_BK` + `JOB_UNID`, so the full
-  join fan-out only executes for the rows that actually survive to the output.
+the detail joins for the winners. The dedup is scoped per source system by design anyway (TMFF `SHPNO`
+and OPS `HWB` are two unrelated numbering schemes), so each detail branch computes its own winner pool
+independently, right inside its own `JOIN`:
+- `House`/`CreateDate`/`JOB_UNID` sit directly on the driving row (`TMFF_JOB.SHPNO`/`CREATEDATE`/`UNID`,
+  `tblAWB.HWB`/`EntryDate`/`rowguid_AWB`), plus whatever's needed to know a row qualifies at all (the
+  ICOID business-rule filter and the slave-AWB exclusion on the OPS side).
+- `ROW_NUMBER() OVER (PARTITION BY COALESCE(House, JOB_UNID) ORDER BY CreateDate ASC, JOB_UNID ASC) = 1`
+  picks the winner within each pool - no `System_BK` needed in the partition since each pool only ever
+  contains one system's rows.
+- Each detail branch `JOIN`s onto its own winner-pick derived table by `JOB_UNID`, so the full join
+  fan-out only executes for the rows that actually survive to the output.
+
+Earlier drafts first `UNION ALL`'d the TMFF and OPS candidate rows into one pool, then ranked with
+`PARTITION BY System_BK, COALESCE(House, JOB_UNID)` and filtered each detail branch back out by
+`System_BK`. Pointless: the two systems never compete for the same dedup group, so combining them first
+just to immediately split them apart by `System_BK` added a UNION ALL, an extra column, and a wider
+partition key for no benefit. Ranking each system's candidates independently removes all of that.
 
 **One exception**: TMFF's `ShipmentID` is computed by a window function (`MIN`/`MAX`/`FIRST_VALUE`)
 partitioned by `GSHPID` across *every* active `TMFF_JOB` row sharing that group, to pick a canonical
@@ -95,11 +103,11 @@ per unique shipment instead of once per underlying JOB/AWB.
 
 Per the same rule applied to `Reports.v_Job`: a `WITH` CTE earns its name only when it's referenced more
 than once; a CTE used exactly once is just a derived table with a label, so it's inlined at its one use
-site instead. `cte_Winners` is the only remaining named CTE (it's joined from both the TMFF and OPS
-detail branches). The candidate pool, the TEU rollup, and the TMFF `ShipmentID` lookup were each
-previously their own CTE (`cte_Candidates`, `cte_TEU`, `cte_TMFF_ShipmentId`) but are referenced from
-exactly one place, so they're now inline derived tables at that place - same logic, same execution plan
-(SQL Server doesn't materialize CTEs any more than derived tables), just without the extra `WITH` name.
+site instead. `v_Shipment.sql` has no top-level `WITH` at all now - once the winner-pick was split per
+system (see above), every intermediate result (each branch's own winner pick, TMFF's `ShipmentID`
+lookup, the TEU rollup) is referenced from exactly one place, so each is an inline derived table right
+where it's used - same logic, same execution plan (SQL Server doesn't materialize CTEs any more than
+derived tables), just without an extra `WITH` name.
 
 ## Scope filters adopted from InvoiceDetails.sql
 
