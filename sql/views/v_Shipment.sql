@@ -457,10 +457,13 @@ select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
 			, Weight_UT					=	cast(a.TotalDimWeight											as varchar(50))
 			, UniqueRecordKey			=	utilities.ufn_GetHashedUID('NORAMOPSDW', coalesce(cast(a.rowguid_AWB as varchar(500)), '¤NULL¤'), default, default, default)
 
-from		(
-			select		  *
-						, rn	=	row_number() over (partition by ShipmentID order by x.EntryDate asc, x.rowguid_AWB asc)
+from		( --dedup filtered here, before any detail join attaches (same structure as the TMFF branch's
+			--"j" source) - not left for the optimizer to push a trailing WHERE back through 9 LEFT JOINs.
+			select		*
 			from		(
+						select		  *
+									, rn	=	row_number() over (partition by ShipmentID order by x.EntryDate asc, x.rowguid_AWB asc)
+						from		(
 						select		  a.*
 									, ICOId	=	i.ICOId
 									, ld.DeptName
@@ -572,6 +575,8 @@ from		(
 						and			i.ICOID not like 'CN%'
 						and			samw.Slave_RowGuid_AWB is null
 						) x
+			) y
+			where		rn = 1
 			) a
 left join	( --full MAWB detail lookup (vessel, voyage, flight, ports, dates, carrier service) - joined
 			--only against the deduped winners in "a", not against every candidate (see the minimal
@@ -714,5 +719,4 @@ left join	ODS.NORAMOPSDW_tblAWBShipper shp
 on			a.Rowguid_AWB = shp.Rowguid_AWB
 and			shp.SCD_ActiveFlag = 1
 and			shp.SCD_IsDeleted = 0
-where		a.rn = 1
 GO

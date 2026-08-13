@@ -170,6 +170,17 @@ an inline derived table at its one use site.
 described above moved MAWB's detail fields back out of the source entirely, keeping only the minimal
 `mawmin.MAWB` lookup pre-dedup, so there's nothing left to collide with.)
 
+**One more structural fix, found in final review**: the OPS branch's dedup filter (`WHERE rn = 1`) used
+to sit at the very end of the query, after all 9 external detail `LEFT JOIN`s (`maw`, `vnd`, `piec`,
+`acv`, `ar`, `con`, `lc`, `mawoc`, `intl`, `shp`). SQL Server almost certainly still pushes a filter on a
+preserved-side column like this back through a chain of `LEFT JOIN`s on its own - it's one of the most
+standard query-optimizer transformations there is - but that's relying on the optimizer to do it, not
+the query guaranteeing it. The TMFF branch never has this ambiguity: its dedup filter lives *inside* the
+`j` source itself, so the detail joins physically cannot see anything but winners. OPS now matches that
+shape - the dedup filter is applied inside the source (wrapping the `ShipmentID`-ranked rows in one more
+`SELECT ... WHERE rn = 1` before the source is exposed as `a`), so the same guarantee holds structurally
+on both branches, not just probabilistically on one of them.
+
 ## Scope filters adopted from InvoiceDetails.sql
 
 Same two filters as added to `Reports.v_Job` (see `docs/ASSUMPTIONS.md`), applied in the candidate pool
