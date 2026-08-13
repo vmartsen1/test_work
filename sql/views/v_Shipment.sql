@@ -8,7 +8,20 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-
+-- =====================================================================================================
+-- 1 row = 1 unique shipment (TMFF: dedup by House/SHPNO; OPS: dedup by ShipmentID, the same
+-- canonicalized cross-system shipment identifier used elsewhere - see docs/ASSUMPTIONS_Shipment.md).
+--
+-- Both branches build their own SOURCE first - filtered to the shipment grain (business-rule filters,
+-- dedup, and the fields needed to compute the dedup key all inside it) - then LEFT JOIN everything else
+-- onto that source. Only what the dedup key itself needs runs against every candidate row; anything
+-- that's purely a detail/display field runs only against the winners.
+--
+-- On OPS this specifically means: computing ShipmentID needs ld.ImpExp/TransportMode_BK and MAWB's own
+-- MAWB number (via calc/precalc), so those stay inside the source - but MAWB's OTHER fields (vessel,
+-- voyage, flight, ports, dates, carrier service) are looked up a second time as a plain external detail
+-- join, so that heavier lookup only runs for the deduped winners, not for every candidate AWB.
+-- =====================================================================================================
 ALTER view [Reports].[v_Shipment]
 as
 with cte_TEU as (
@@ -396,28 +409,28 @@ select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
 
 			, DeliveryLocationCode		=	cast(coalesce(a.UltDestCode, mawoc.PlDelvCode, intl.PlDelvCode)	as varchar(50))
 			, Department				=	cast(a.DeptName												as varchar(100))
-			, FinalDestinationLocationCode	=	cast(coalesce(mawoc.PlDelv, a.maw_PlDelv)					as varchar(100))
+			, FinalDestinationLocationCode	=	cast(coalesce(mawoc.PlDelv, maw.PlDelv)					as varchar(100))
 			, FinalDestinationDate		=	a.ScheduledDelivery
 
-			, FlightNumber				=	cast(a.maw_FlightNumber											as varchar(50))
+			, FlightNumber				=	cast(maw.FlightNumber											as varchar(50))
 			, FreightDescription		=	cast(piec.FghtDesc												as varchar(500))
 			, House						=	cast(a.HWB														as varchar(50))
 			, JobNo						=	cast(a.HWB														as varchar(50))
-			, Master					=	cast(a.maw_MAWB													as varchar(50))
+			, Master					=	cast(maw.MAWB													as varchar(50))
 			, ModeOfTransport			=	cast(case	when isnull(a.TransportMode_BK,'') <> ''
 													then a.TransportMode_BK
 													else case when a.IsInternational = 0 then 'Surface' else 'Other' end
 												end															as varchar(50))
 
 			, Pieces					=	a.TotalPieces
-			, POD						=	cast(coalesce(a.PtDischCode, a.DestCityCode, mawoc.PtDischCode, a.maw_DestCityCode)					as varchar(50))
-			, PODETADate				=	coalesce(a.ETADate, a.maw_ETADate)
-			, POL						=	cast(coalesce(a.PtLoadCode, intl.TranShipmentPointCode2, a.OriginCityCode, mawoc.PtLoadCode, a.maw_OriginCityCode)	as varchar(50))
-			, POLETDDate				=	coalesce(a.ETDDate, a.maw_DepartureDate)
+			, POD						=	cast(coalesce(a.PtDischCode, a.DestCityCode, mawoc.PtDischCode, maw.DestCityCode)					as varchar(50))
+			, PODETADate				=	coalesce(a.ETADate, maw.ETADate)
+			, POL						=	cast(coalesce(a.PtLoadCode, intl.TranShipmentPointCode2, a.OriginCityCode, mawoc.PtLoadCode, maw.OriginCityCode)	as varchar(50))
+			, POLETDDate				=	coalesce(a.ETDDate, maw.DepartureDate)
 			, POR						=	cast(coalesce(mawoc.PlAcceptCode, intl.PlAcceptCode)			as varchar(50))
 			, PORETDDate				=	a.DateShip
 
-			, ServiceLevel				=	cast(a.maw_CarrierService											as varchar(50))
+			, ServiceLevel				=	cast(maw.CarrierService											as varchar(50))
 			, ServiceType				=	cast(mawoc.MoveType												as varchar(50))
 
 			, ShipmentID				=	a.ShipmentID
@@ -436,10 +449,10 @@ select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
 			, TEU						=	isnull(piec.TEU,0)
 			, TSP						=	cast(null														as varchar(50))
 
-			, VesselName				=	cast(a.maw_VesselName												as varchar(50))
+			, VesselName				=	cast(maw.VesselName												as varchar(50))
 			, VIA						=	cast(a.GatewayCode												as varchar(50))
 			, Volume					=	case when piec.CnrtLoad = 'FCL' then cw.ChargeableWeight else a.Volume2 end
-			, VoyageNo					=	cast(a.maw_VoyageNo												as varchar(50))
+			, VoyageNo					=	cast(maw.VoyageNo												as varchar(50))
 			, Weight					=	a.TotalWeight
 			, Weight_UT					=	cast(a.TotalDimWeight											as varchar(50))
 			, UniqueRecordKey			=	utilities.ufn_GetHashedUID('NORAMOPSDW', coalesce(cast(a.rowguid_AWB as varchar(500)), '¤NULL¤'), default, default, default)
@@ -452,16 +465,6 @@ from		(
 									, ICOId	=	i.ICOId
 									, ld.DeptName
 									, ld.TransportMode_BK
-									, maw_PlDelv			=	maw.PlDelv
-									, maw_FlightNumber		=	maw.FlightNumber
-									, maw_MAWB				=	maw.MAWB
-									, maw_DestCityCode		=	maw.DestCityCode
-									, maw_ETADate			=	maw.ETADate
-									, maw_OriginCityCode	=	maw.OriginCityCode
-									, maw_DepartureDate		=	maw.DepartureDate
-									, maw_CarrierService	=	maw.CarrierService
-									, maw_VesselName		=	maw.VesselName
-									, maw_VoyageNo			=	maw.VoyageNo
 									, ShipmentID =	cast(utilities.ufn_GetCleanGlobalShipmentId(trim(coalesce(calc.HouseNoForGlobalShipment, calc.MasterNoForGlobalShipment, calc.UniqueBookingIdentifier)))	as varchar(150))
 						from		(
 									select		  *
@@ -514,23 +517,16 @@ from		(
 						and			a.LinkServer = ld.LinkServer
 						and			ld.SCD_ActiveFlag = 1
 						and			ld.SCD_IsDeleted = 0
-						left join	(
+						left join	( --minimal MAWB lookup: only the MAWB number itself is needed to compute
+									--ShipmentID's Master fallback below. MAWB's other fields (vessel, voyage, flight,
+									--ports, dates, carrier service) are looked up again further down, but as a plain
+									--detail join, so that heavier lookup only runs for the winning (deduped) rows,
+									--not for every candidate here.
 									select		*
 									from		(
-												select		  rowguid_AWB					=	am.rowguid_AWB
-															, MAWB							=	first_value(m.MAWB)					over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, OriginCityCode				=	first_value(m.OriginCityCode)			over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, DestCityCode					=	first_value(m.DestCityCode)			over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, DepartureDate					=	first_value(m.DepartureDate)			over(partition by am.rowguid_AWB order by m.DepartureDate desc)
-															, ETADate						=	first_value(m.ETADate)					over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, PTLOAD						=	first_value(m.PTLOAD)					over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, PlDelv						=	first_value(m.PlDelv)					over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, VesselName					=	first_value(m.VesselName)				over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, VoyageNo						=	first_value(m.VoyageNo)					over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, CarrierService				=	first_value(m.CarrierService)			over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, FlightNumber					=	first_value(m.FlightNumber)				over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, rowguid_CarrierVendor			=	first_value(m.rowguid_CarrierVendor)	over(partition by am.rowguid_AWB order by m.LastEdit desc)
-															, ix							=	row_number()							over(partition by am.rowguid_AWB order by m.LastEdit desc)
+												select		  am.rowguid_AWB
+															, MAWB	=	first_value(m.MAWB) over(partition by am.rowguid_AWB order by m.LastEdit desc)
+															, ix	=	row_number()		 over(partition by am.rowguid_AWB order by m.LastEdit desc)
 												from		ODS.NORAMOPSDW_tblMAWB m
 												join		ODS.NORAMOPSDW_xrfMAWBAWB am
 												on			m.rowguid_MAWB = am.rowguid_MAWB
@@ -540,18 +536,18 @@ from		(
 												and			m.SCD_IsDeleted = 0
 												) x
 									where		ix = 1
-									) maw
-						on			maw.rowguid_AWB = a.rowguid_AWB
+									) mawmin
+						on			mawmin.rowguid_AWB = a.rowguid_AWB
 						cross apply	(
 									select		  HouseNo						=	case	when ld.ImpExp = 'E' then left(a.HWB,11)
 																							when a.ImportHWBNo is not null then a.ImportHWBNo
 																							when a.HWB like '[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9]%' then left(a.HWB,11)
 																							else a.HWB
 																					end
-												, MasterNo						=	cast(nullif(nullif(trim(isnull(maw.MAWB,'')),''),'----')	as varchar(100))
+												, MasterNo						=	cast(nullif(nullif(trim(isnull(mawmin.MAWB,'')),''),'----')	as varchar(100))
 												, MasterNoForGlobalShipment		=	cast(case	when ld.TransportMode_BK <> 'Air' then null
-																							when replace(replace(maw.MAWB,'0',''),'-','') = '' then null
-																							else nullif(nullif(trim(isnull(maw.MAWB,'')),''),'----') end	as varchar(100))
+																							when replace(replace(mawmin.MAWB,'0',''),'-','') = '' then null
+																							else nullif(nullif(trim(isnull(mawmin.MAWB,'')),''),'----') end	as varchar(100))
 												, UniqueBookingIdentifier		=	cast('NORAMOPSDW|' + isnull(convert(varchar(16),a.AWBID),'')	as varchar(100))
 									) precalc
 						cross apply	(
@@ -577,6 +573,36 @@ from		(
 						and			samw.Slave_RowGuid_AWB is null
 						) x
 			) a
+left join	( --full MAWB detail lookup (vessel, voyage, flight, ports, dates, carrier service) - joined
+			--only against the deduped winners in "a", not against every candidate (see the minimal
+			--MAWB lookup inside the source above, used only to compute ShipmentID's Master fallback).
+			select		*
+			from		(
+						select		  rowguid_AWB					=	am.rowguid_AWB
+									, MAWB							=	first_value(m.MAWB)					over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, OriginCityCode				=	first_value(m.OriginCityCode)			over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, DestCityCode					=	first_value(m.DestCityCode)			over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, DepartureDate					=	first_value(m.DepartureDate)			over(partition by am.rowguid_AWB order by m.DepartureDate desc)
+									, ETADate						=	first_value(m.ETADate)					over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, PTLOAD						=	first_value(m.PTLOAD)					over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, PlDelv						=	first_value(m.PlDelv)					over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, VesselName					=	first_value(m.VesselName)				over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, VoyageNo						=	first_value(m.VoyageNo)					over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, CarrierService				=	first_value(m.CarrierService)			over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, FlightNumber					=	first_value(m.FlightNumber)				over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, rowguid_CarrierVendor			=	first_value(m.rowguid_CarrierVendor)	over(partition by am.rowguid_AWB order by m.LastEdit desc)
+									, ix							=	row_number()							over(partition by am.rowguid_AWB order by m.LastEdit desc)
+						from		ODS.NORAMOPSDW_tblMAWB m
+						join		ODS.NORAMOPSDW_xrfMAWBAWB am
+						on			m.rowguid_MAWB = am.rowguid_MAWB
+						and			am.SCD_ActiveFlag = 1
+						and			am.SCD_IsDeleted = 0
+						where		m.SCD_ActiveFlag = 1
+						and			m.SCD_IsDeleted = 0
+						) x
+			where		ix = 1
+			) maw
+on			maw.rowguid_AWB = a.rowguid_AWB
 left join	(
 			select		*
 			from		(

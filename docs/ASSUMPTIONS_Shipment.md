@@ -104,14 +104,27 @@ and then filtered or split apart afterwards - each source scans its driving tabl
 - **OPS**: `ODS.NORAMOPSDW_tblAWB` is scanned once, filtered to `LinkServer = 'TGOPSINTL'` immediately,
   deduplicated to the current SCD version per physical AWB (`rnv` - named distinctly from the outer
   dedup's `rn` to avoid a column-name collision once both are exposed on the same derived table), then
-  joined to `tblICO` (its `ICOId` carried through so the detail portion never needs to rejoin `tblICO`),
-  `lkpDepartment`, and the MAWB lookup (columns explicitly prefixed `maw_...` to avoid colliding with
-  `tblAWB`'s own native columns of the same name - `ETADate`, `DestCityCode`, `OriginCityCode` all exist
-  natively on `tblAWB` *and* on the MAWB lookup, as two genuinely different values the output's
-  coalesce chains intentionally combine). `ShipmentID` is computed here too (it needs those MAWB/
-  department joins via `calc`/`precalc`), and the OPS dedup ranks by `ShipmentID` rather than raw `HWB`
-  (see "Clarification on 'based on House'" above) - `ROW_NUMBER() OVER (PARTITION BY ShipmentID ORDER BY
-  EntryDate ASC, rowguid_AWB ASC) = 1`.
+  joined to `tblICO` (its `ICOId` carried through so the detail portion never needs to rejoin `tblICO`)
+  and `lkpDepartment` (`DeptName`/`TransportMode_BK` - a cheap dimension lookup, no window functions, so
+  no reason not to have it live in the source and cover both `ShipmentID`'s needs and the `Department`/
+  `ModeOfTransport` output fields at once). `ShipmentID` is computed here too, via `calc`/`precalc`,
+  which needs the MAWB number - but *only* the MAWB number, not any of MAWB's other fields. So the
+  source joins a **minimal** MAWB lookup (`mawmin`: just `rowguid_AWB`, `MAWB`) rather than the full
+  11-column, `first_value()`-window-function-heavy MAWB derived table. The rest of MAWB's fields
+  (vessel, voyage, flight, ports, dates, carrier service) are looked up a *second* time, by the same
+  derived-table shape, but as a plain external detail join against the already-deduped winners - so that
+  heavier lookup runs once per unique shipment, not once per candidate AWB. The OPS dedup itself ranks
+  by `ShipmentID` rather than raw `HWB` (see "Clarification on 'based on House'" above) -
+  `ROW_NUMBER() OVER (PARTITION BY ShipmentID ORDER BY EntryDate ASC, rowguid_AWB ASC) = 1`.
+
+  This two-tier MAWB lookup (minimal inside the source, full as an external detail join) replaced an
+  earlier version that pulled the *entire* rich MAWB derived table into the source just to get at its
+  `MAWB` column - which meant every one of its `first_value()` columns, and the join fan-out to compute
+  them, ran once per *candidate* AWB rather than once per *winning* shipment. Given `ShipmentID`
+  unavoidably needs to run before the dedup can happen (it *is* the dedup key), the goal here isn't to
+  avoid touching MAWB/department before dedup entirely - that's not possible - it's to make what runs
+  pre-dedup as cheap as it can be, and defer everything that isn't strictly needed for the dedup key
+  itself to post-dedup, same principle as the TMFF side.
 
 The dedup is scoped per source system by design anyway (TMFF `SHPNO` and OPS `HWB` are two unrelated
 numbering schemes, and each source only ever contains its own system's rows), so there's no `System_BK`
@@ -152,6 +165,10 @@ an inline derived table at its one use site.
   same derived table) - both are the same underlying lesson: give every window-function or lookup
   column that lands in the same projection a name that's unique across the whole projection, not just
   locally unique at the level it was computed.
+
+(The `maw_*`-prefixed columns from that fix no longer exist in the current version - the follow-up pass
+described above moved MAWB's detail fields back out of the source entirely, keeping only the minimal
+`mawmin.MAWB` lookup pre-dedup, so there's nothing left to collide with.)
 
 ## Scope filters adopted from InvoiceDetails.sql
 
