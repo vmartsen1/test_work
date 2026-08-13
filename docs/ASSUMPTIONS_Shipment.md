@@ -50,10 +50,31 @@ next section) - the dedup now happens *before* the detail joins instead of after
 Two design decisions were confirmed with the user rather than assumed:
 - **Dedup scope**: within each source system separately (TMFF `SHPNO` vs OPS `HWB` are two unrelated
   numbering schemes - a text coincidence between them should not merge two unrelated shipments). This
-  needed a `System_BK` column (`'TMFF'` / `'NORAMOPSDW'`, same convention as the real
-  `v_TMFF_Shipment`/`v_NORAMOPSDW_Shipment`).
+  needed a `System_BK` column (`'TMFF'` / `'OPS'` - aligned to the same literal `Reports.v_Job` uses,
+  after that view's own final revision moved away from `'NORAMOPSDW'`).
 - **"First job" tie-break**: earliest `CreateDate`, with `JOB_UNID` as a deterministic secondary
   tie-break for same-timestamp rows.
+
+**Clarification on "based on House"**: the dedup key isn't a change of business logic away from House -
+the point is simply that `Reports.v_Job` is split by JOB, `Reports.v_Shipment` must be split by
+*shipment*, and a shipment is, in practice, identified by its House number. For TMFF that's literally
+`SHPNO`. For OPS, the view dedups by `ShipmentID` rather than raw `HWB` - `ShipmentID` is the same
+canonicalized House/Master identifier (`ufn_GetCleanGlobalShipmentId` over
+`HouseNoForGlobalShipment`/`MasterNoForGlobalShipment`, falling back to a per-AWB
+`UniqueBookingIdentifier`) already used everywhere else in this codebase as *the* cross-system shipment
+identifier, so using it as the OPS dedup key too keeps "unique shipment" consistent with what
+`ShipmentID` already means elsewhere, rather than dedupping on the raw, unnormalized `HWB` string.
+
+One consequence worth knowing: when both `HouseNoForGlobalShipment` and `MasterNoForGlobalShipment` are
+null/invalid (short or non-numeric), `ShipmentID` falls back to `UniqueBookingIdentifier`, which embeds
+`AWBID` and is therefore unique per physical AWB row - in that fallback tier, dedup is effectively a
+no-op (each such row is its own "unique shipment"). This isn't a new risk introduced by choosing
+`ShipmentID` over `HWB`: the earlier `HWB`-based dedup had the identical property (`COALESCE(HWB,
+rowguid_AWB)` also falls back to a per-row-unique value when `HWB` is unusable). It's an inherent limit
+of any dedup-by-fallback-key, not a bug - you can't group rows that don't share a usable key. The SQL
+mechanics still guarantee the *output* itself is unique per `ShipmentID` (`ROW_NUMBER() OVER (PARTITION
+BY ShipmentID ...) = 1` can never emit two rows with the same value) - what can vary is only how many
+distinct groups a batch of AWBs collapses into upstream of that.
 
 Rows with a `NULL` House are not collapsed into each other - the partition key falls back to `JOB_UNID`
 (always unique) for those, so a `NULL` House doesn't accidentally bucket unrelated shipments together
@@ -81,10 +102,16 @@ and then filtered or split apart afterwards - each source scans its driving tabl
   UNID ASC) = 1`, and `ShipmentID` is computed in the same source (see below) instead of a separate
   lookup joined back in afterwards.
 - **OPS**: `ODS.NORAMOPSDW_tblAWB` is scanned once, filtered to `LinkServer = 'TGOPSINTL'` immediately,
-  deduplicated to the current SCD version per physical AWB (`rnv`), then joined to `tblICO` (its `ICOId`
-  carried through in the source so the detail portion never needs to rejoin `tblICO`) and the slave-AWB
-  exclusion, then deduplicated to 1 row per House (`HWB`) the same way as TMFF. `ShipmentID` still needs
-  the department/MAWB joins (`calc`/`precalc`), so it stays a detail-join field for OPS, same as before.
+  deduplicated to the current SCD version per physical AWB (`rnv` - named distinctly from the outer
+  dedup's `rn` to avoid a column-name collision once both are exposed on the same derived table), then
+  joined to `tblICO` (its `ICOId` carried through so the detail portion never needs to rejoin `tblICO`),
+  `lkpDepartment`, and the MAWB lookup (columns explicitly prefixed `maw_...` to avoid colliding with
+  `tblAWB`'s own native columns of the same name - `ETADate`, `DestCityCode`, `OriginCityCode` all exist
+  natively on `tblAWB` *and* on the MAWB lookup, as two genuinely different values the output's
+  coalesce chains intentionally combine). `ShipmentID` is computed here too (it needs those MAWB/
+  department joins via `calc`/`precalc`), and the OPS dedup ranks by `ShipmentID` rather than raw `HWB`
+  (see "Clarification on 'based on House'" above) - `ROW_NUMBER() OVER (PARTITION BY ShipmentID ORDER BY
+  EntryDate ASC, rowguid_AWB ASC) = 1`.
 
 The dedup is scoped per source system by design anyway (TMFF `SHPNO` and OPS `HWB` are two unrelated
 numbering schemes, and each source only ever contains its own system's rows), so there's no `System_BK`
@@ -108,6 +135,23 @@ gap is closed.
 No named CTEs remain except `cte_TEU`, kept by explicit request even though it's referenced only once
 (from the TMFF branch) - everything else (each branch's source, both slave-AWB-exclusion subqueries) is
 an inline derived table at its one use site.
+
+**Bugs caught and fixed across the source-first rewrites** (mechanical review, not logic changes):
+- An `iw` alias referenced in a `WHERE` clause that no longer existed after a rename to `i` - would have
+  failed to compile ("invalid column name").
+- An outer-scope alias (`a`) referenced inside a derived table where only its own inner alias (`x`) was
+  in scope - `ORDER BY` clauses need to reference the alias actually visible at that nesting level.
+- Column-name collisions from pulling MAWB-lookup columns into the TMFF/OPS sources without renaming
+  them: `ETADate`, `DestCityCode`, `OriginCityCode` (and similar) exist as both a native `tblAWB` column
+  and a same-named MAWB-lookup column: `SELECT a.*, ..., maw.ETADate, ...` produces two columns both
+  named `ETADate`, which raises "ambiguous column name" the moment anything downstream references it
+  unqualified - fixed by explicitly prefixing the MAWB-derived versions (`maw_ETADate`, etc.).
+- A duplicate column (`SHPNO` listed twice) in the TMFF source's explicit column list, and a `rn`/`rnv`
+  collision in the OPS source (the physical-SCD-version-pick window function and the outer House/
+  ShipmentID dedup window function ended up with the same column name once both were exposed on the
+  same derived table) - both are the same underlying lesson: give every window-function or lookup
+  column that lands in the same projection a name that's unique across the whole projection, not just
+  locally unique at the level it was computed.
 
 ## Scope filters adopted from InvoiceDetails.sql
 
