@@ -10,20 +10,8 @@ attached via `left join` afterward.
 ## Key design decisions
 
 1. **TMFF source tables: `ODS.TMFF_REVENUE` / `ODS.TMFF_COST`, not `JCREVENUE`/`JCCOST`.**
-   The Excel tab names `JCREVENUE`/`JCCOST` as the TMFF entities, but neither table has
-   `RECOGNITIONAMTLC`, a party/counterparty column, or any VAT column anywhere in the
-   reference view dump — they only carry `JOB_UNID, SNO, SOURCEUNID, SOURCESNO,
-   SOURCETYPE, CHRGCODE, CHRGDESC, AMTFC, AMTLC, ACTUALAMTBC, ACTUALAMTLC, CURRCODE,
-   ACTUALCURRCODE`, and are used in exactly one place (`v_TMFF_dim_File`) purely as a
-   bridge to look up the latest recognition `CreateDate` for a Job.
-   `ODS.TMFF_REVENUE`/`TMFF_COST` — the tables `CALC.v_TMFF_RecognitionEvents` itself is
-   built from — carry every field Economy needs (`RECOGNITIONAMTLC`, `ACTUALVATAMTLC`,
-   `BILLING_PARTYID`/`PAYEE_PARTYID`, `INVSTS`, `DOCTYPE`, plus the same amount columns).
-   **Open question:** please confirm `TMFF_REVENUE`/`TMFF_COST` are in fact the real
-   current-state charge-line tables (my working hypothesis is `JCREVENUE`/`JCCOST` are a
-   legacy/alternate name for the same underlying source-system concept, or a narrower
-   bridge table) — or point me to `JCREVENUE`/`JCCOST`'s real DDL if they're genuinely
-   different and richer than what's in the reference dump.
+   **CONFIRMED by user:** `JCREVENUE`/`JCCOST` is just another name for the same thing —
+   `TMFF_REVENUE`/`TMFF_COST` are the real tables to build on.
 
 2. **Row filter**: `SCD_ActiveFlag=1, SCD_IsDeleted=0, isnull(INVSTS,'') not in ('C','V')`
    on both `TMFF_REVENUE` and `TMFF_COST` — matches the "current state" (non-changelog)
@@ -36,9 +24,7 @@ attached via `left join` afterward.
    TMFF = `JOB.GSHPID` (direct column), OPS = `LEFT(AWB.HWB, 11)`. This is *not* the
    fuller fallback chain (`HouseNoForGlobalShipment`/`MasterNoForGlobalShipment`/
    `UniqueBookingIdentifier`) built for `Reports.v_Shipment`.
-   **Open question:** should Economy's `ShipmentID` align exactly with `v_Shipment`'s
-   (so charge lines join cleanly to the Shipment dimension), or is the simple version
-   (matching your already-built `InvoiceDetails.sql`) intentional here?
+   **CONFIRMED by user:** keep it exactly as in `InvoiceDetails.sql` for now.
 
 4. **Creditor / Debtor resolution:**
    - TMFF: `FMPARTY.PARTYID`/`FULLNAME`, joined via `BILLING_PARTYID` (revenue→Debtor) /
