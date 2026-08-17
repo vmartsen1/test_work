@@ -42,11 +42,50 @@ attached via `left join` afterward.
    established path — flag if you'd rather I use `lkpVendor.VendorNo/VendorName` instead
    (simpler, but not how any existing production view resolves this).
 
+   **Deliberate deviation from `InvoiceDetails.sql` for TMFF Debtor/Creditor:**
+   `InvoiceDetails.sql` resolves TMFF Debtor from `TMFF_IVHDR.PARTYID_CUST`/`CUSTNAME` (the
+   invoice *header*, already denormalized). I did **not** copy that here: `TMFF_IVHDR` only
+   exists for charge lines that have already been invoiced (via `TMFF_IVDTL.SOURCEUNID/
+   SOURCESNO`), so a not-yet-invoiced *estimated* line would get a null Debtor/Creditor if I
+   used the invoice-header route. `BILLING_PARTYID`/`PAYEE_PARTYID` are populated directly on
+   every `TMFF_REVENUE`/`TMFF_COST` row regardless of invoice status (confirmed via
+   `CALC.v_TMFF_RecognitionEvents`, which reads them the same way in every branch), so FMPARTY
+   via those columns covers the full grain. Flag if this reasoning is wrong.
+
 5. **`ChargeCodeCategory`** sourced exactly as in your `InvoiceDetails.sql`: TMFF via
    `FMCHARGECODE.CATEGORYSVR → FMCODE.CODE (TYPE='CCT') → DESCRIPTION`; OPS via
    `lkpChargeCode.ReportsCategory`. Neither `CATEGORYSVR` nor `ReportsCategory` appears
    anywhere in the two bulk reference-view dumps, but since your own reference query
    already uses them successfully, I'm treating that as ground truth over the dumps.
+
+6. **`ChargeCodeDescription` (TMFF) switched to `fmcc.CHRGDESC`** (the canonical
+   `FMCHARGECODE` lookup value), matching `InvoiceDetails.sql` exactly — previously I was
+   using the charge line's own inline `CHRGDESC` copy from `TMFF_REVENUE`/`TMFF_COST`.
+   OPS `ChargeCodeDescription` stays as the line's own inline `ChrgDesc` (no lookup),
+   matching `InvoiceDetails.sql`'s OPS half, which does *not* use a canonical lookup there.
+
+7. **Credit-note sign flip added for TMFF** (new — this was a real gap in the first draft).
+   `InvoiceDetails.sql` flips `AMTFC`/`AMTBC` by `case when DOCTYPE='CN' then -1 else 1 end`.
+   `TMFF_REVENUE`/`TMFF_COST` each carry their own `DOCTYPE` (confirmed via
+   `CALC.v_TMFF_RecognitionEvents`, which uses the identical flip to compute its recognition
+   deltas). I now compute `Multiplier = case when DOCTYPE='CN' then -1 else 1 end` once per
+   row (`cross apply`) and apply it uniformly to every monetary column — `AMTFC, AMTLC,
+   ACTUALAMTBC, ACTUALAMTLC, ACTUALVATAMTLC, RECOGNITIONAMTLC` — not just the two
+   `InvoiceDetails.sql` happens to expose, since a credit note logically reverses the whole
+   line, not a subset of its amounts. `RecognitionAmountFC`'s ratio formula
+   (`RECOGNITIONAMTLC * (AMTFC/AMTLC)`) is unaffected by this since the flip cancels out of
+   the `AMTFC/AMTLC` ratio and is still applied once via the (now pre-signed) `RECOGNITIONAMTLC`.
+   OPS gets no equivalent flip — `InvoiceDetails.sql`'s OPS half has no `DOCTYPE`/credit-note
+   concept, so none was added.
+
+8. **Not ported over**: `InvoiceDetails.sql`'s two separate currency codes
+   (`ChargelineCurrencyCode` vs `InvoiceCurrencyCode`) collapse to Economy's single
+   `CurrencyCode`, since the Excel spec for Economy only asks for one currency field per
+   row. Also noticed a likely bug in `InvoiceDetails.sql`'s OPS half while reviewing it:
+   the `cuh` (header currency) join reads `on cu.rowguid_Currency = ivh.rowguid_Currency` —
+   comparing the *line*-currency lookup's key to the header's raw guid, which looks like it
+   should be `cuh.rowguid_Currency = ivh.rowguid_Currency`. Doesn't affect `v_Economy` (I
+   only use the line-level currency), but flagging in case it matters elsewhere.
 
 ## Fields with no confirmed source (nulled + commented inline in the view)
 

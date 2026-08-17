@@ -19,11 +19,11 @@ select		  JOB_UNID					=	cast(j.JOB_UNID													as varchar(50))
 			, System_BK					=	cast('TMFF'														as varchar(50))
 			, ShipmentID				=	cast(j.GSHPID													as varchar(50))
 			, ChargeType				=	cast(j.ChargeType												as varchar(10))
-			, ChargeCode				=	cast(j.ChrgCode													as varchar(50))
-			, ChargeCodeDescription		=	cast(j.ChrgDesc													as varchar(100))
+			, ChargeCode				=	cast(j.CHRGCODE													as varchar(50))
+			, ChargeCodeDescription		=	cast(fmcc.CHRGDESC												as varchar(100))	--canonical lookup description, not the line's own inline copy (per InvoiceDetails.sql)
 			, ChargeCodeCategory		=	cast(fmc.[DESCRIPTION]											as varchar(100))
 			, CurrencyCode				=	cast(j.CURRCODE													as varchar(50))
-			, AmountFC					=	try_cast(j.AMTFC												as float)
+			, AmountFC					=	try_cast(j.AMTFC												as float)	--already sign-adjusted for credit notes, see src
 			, AmountLC					=	try_cast(j.AMTLC												as float)
 			, ActualAmountFC			=	try_cast(j.ACTUALAMTBC											as float)
 			, ActualAmountLC			=	try_cast(j.ACTUALAMTLC											as float)
@@ -44,7 +44,6 @@ from		(
 						, src.SNO
 						, src.ChargeType
 						, src.CHRGCODE
-						, src.CHRGDESC
 						, src.AMTFC
 						, src.AMTLC
 						, src.ACTUALAMTBC
@@ -61,17 +60,17 @@ from		(
 									, SNO				=	r.SNO
 									, ChargeType		=	cast('REVENUE' as varchar(10))
 									, CHRGCODE			=	r.CHRGCODE
-									, CHRGDESC			=	r.CHRGDESC
-									, AMTFC				=	r.AMTFC
-									, AMTLC				=	r.AMTLC
-									, ACTUALAMTBC		=	r.ACTUALAMTBC
-									, ACTUALAMTLC		=	r.ACTUALAMTLC
-									, ACTUALVATAMTLC	=	r.ACTUALVATAMTLC
+									, AMTFC				=	r.AMTFC				* m.Multiplier
+									, AMTLC				=	r.AMTLC				* m.Multiplier
+									, ACTUALAMTBC		=	r.ACTUALAMTBC		* m.Multiplier
+									, ACTUALAMTLC		=	r.ACTUALAMTLC		* m.Multiplier
+									, ACTUALVATAMTLC	=	r.ACTUALVATAMTLC	* m.Multiplier
 									, CURRCODE			=	r.CURRCODE
 									, ACTUALCURRCODE	=	r.ACTUALCURRCODE
-									, RECOGNITIONAMTLC	=	r.RECOGNITIONAMTLC
+									, RECOGNITIONAMTLC	=	r.RECOGNITIONAMTLC	* m.Multiplier
 									, PartyId			=	r.BILLING_PARTYID
 						from		ODS.TMFF_REVENUE r
+						cross apply (select Multiplier = case when r.DOCTYPE = 'CN' then -1 else 1 end) m	--a credit note reverses every monetary field on the line (per InvoiceDetails.sql)
 						where		r.SCD_ActiveFlag = 1
 						and			r.SCD_IsDeleted = 0
 						and			isnull(r.INVSTS, '') not in ('C', 'V')	--exclude voided/credited lines, replaced by new charge lines (per CALC.v_TMFF_RecognitionEvents convention)
@@ -80,17 +79,17 @@ from		(
 									, SNO				=	c.SNO
 									, ChargeType		=	cast('COST' as varchar(10))
 									, CHRGCODE			=	c.CHRGCODE
-									, CHRGDESC			=	c.CHRGDESC
-									, AMTFC				=	c.AMTFC
-									, AMTLC				=	c.AMTLC
-									, ACTUALAMTBC		=	c.ACTUALAMTBC
-									, ACTUALAMTLC		=	c.ACTUALAMTLC
-									, ACTUALVATAMTLC	=	c.ACTUALVATAMTLC
+									, AMTFC				=	c.AMTFC				* m.Multiplier
+									, AMTLC				=	c.AMTLC				* m.Multiplier
+									, ACTUALAMTBC		=	c.ACTUALAMTBC		* m.Multiplier
+									, ACTUALAMTLC		=	c.ACTUALAMTLC		* m.Multiplier
+									, ACTUALVATAMTLC	=	c.ACTUALVATAMTLC	* m.Multiplier
 									, CURRCODE			=	c.CURRCODE
 									, ACTUALCURRCODE	=	c.ACTUALCURRCODE
-									, RECOGNITIONAMTLC	=	c.RECOGNITIONAMTLC
+									, RECOGNITIONAMTLC	=	c.RECOGNITIONAMTLC	* m.Multiplier
 									, PartyId			=	c.PAYEE_PARTYID
 						from		ODS.TMFF_COST c
+						cross apply (select Multiplier = case when c.DOCTYPE = 'CN' then -1 else 1 end) m
 						where		c.SCD_ActiveFlag = 1
 						and			c.SCD_IsDeleted = 0
 						and			isnull(c.INVSTS, '') not in ('C', 'V')	--exclude voided/credited lines, replaced by new charge lines (per CALC.v_TMFF_RecognitionEvents convention)
