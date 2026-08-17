@@ -64,19 +64,18 @@ attached via `left join` afterward.
    OPS `ChargeCodeDescription` stays as the line's own inline `ChrgDesc` (no lookup),
    matching `InvoiceDetails.sql`'s OPS half, which does *not* use a canonical lookup there.
 
-7. **Credit-note sign flip added for TMFF** (new — this was a real gap in the first draft).
-   `InvoiceDetails.sql` flips `AMTFC`/`AMTBC` by `case when DOCTYPE='CN' then -1 else 1 end`.
-   `TMFF_REVENUE`/`TMFF_COST` each carry their own `DOCTYPE` (confirmed via
-   `CALC.v_TMFF_RecognitionEvents`, which uses the identical flip to compute its recognition
-   deltas). I now compute `Multiplier = case when DOCTYPE='CN' then -1 else 1 end` once per
-   row (`cross apply`) and apply it uniformly to every monetary column — `AMTFC, AMTLC,
-   ACTUALAMTBC, ACTUALAMTLC, ACTUALVATAMTLC, RECOGNITIONAMTLC` — not just the two
-   `InvoiceDetails.sql` happens to expose, since a credit note logically reverses the whole
-   line, not a subset of its amounts. `RecognitionAmountFC`'s ratio formula
-   (`RECOGNITIONAMTLC * (AMTFC/AMTLC)`) is unaffected by this since the flip cancels out of
-   the `AMTFC/AMTLC` ratio and is still applied once via the (now pre-signed) `RECOGNITIONAMTLC`.
-   OPS gets no equivalent flip — `InvoiceDetails.sql`'s OPS half has no `DOCTYPE`/credit-note
-   concept, so none was added.
+7. **No credit-note sign flip on TMFF `AMTFC`/`AMTLC`/etc. — reverted.** An earlier version
+   of this view added `Multiplier = case when DOCTYPE='CN' then -1 else 1 end` and applied it
+   to every monetary column, copying `InvoiceDetails.sql`'s flip. That was wrong: I mis-read
+   `CALC.v_TMFF_RecognitionEvents`. Re-checking it — `Multiplier` there is used **only** to
+   compute `RECORDAMTLC = RECOGNITIONAMTLC * multiplier - Prev_RECOGNITIONAMTLC * prev_multiplier`
+   (a recognition-period *delta*). Every branch of that view (base, changelog, actualized)
+   passes `AMTLC`/`AMTFC`/`ACTUALAMTLC`/`ACTUALAMTFC`/`RECOGNITIONAMTLC` straight through
+   **unmultiplied**. `InvoiceDetails.sql`'s flip applies to a different table pair
+   (`TMFF_IVDTL`/`IVHDR`, the invoice layer) with its own sign convention — it doesn't follow
+   that `TMFF_REVENUE`/`TMFF_COST` need the same treatment, and the reference view that
+   actually reads those two tables confirms they don't. Reverted to plain passthrough of
+   `AMTFC, AMTLC, ACTUALAMTBC, ACTUALAMTLC, ACTUALVATAMTLC, RECOGNITIONAMTLC`, no multiplier.
 
 8. **Not ported over**: `InvoiceDetails.sql`'s two separate currency codes
    (`ChargelineCurrencyCode` vs `InvoiceCurrencyCode`) collapse to Economy's single
