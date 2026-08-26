@@ -19,40 +19,42 @@ select		  JOB_UNID					=	cast(j.JOB_UNID													as varchar(50))
 			, System_BK					=	cast('TMFF'														as varchar(50))
 			, ShipmentID				=	cast(j.GSHPID													as varchar(50))
 			, ChargeType				=	cast(j.ChargeType												as varchar(10))
-			, ChargeCode				=	cast(string_agg(cast(j.CHRGCODE as varchar(max)), ', ')			as varchar(200))
-			, ChargeCodeDescription		=	cast(string_agg(cast(fmcc.CHRGDESC as varchar(max)), ', ')			as varchar(500))
-			, ChargeCodeCategory		=	cast(string_agg(cast(fmc.[DESCRIPTION] as varchar(max)), ', ')		as varchar(500))
+			, ChargeCode				=	cast(string_agg(distinct cast(j.CHRGCODE			as varchar(max))	, ', ')	as varchar(100))
+			, ChargeCodeDescription		=	cast(string_agg(distinct cast(fmcc.CHRGDESC		as varchar(max))	, ', ')	as varchar(500))
+			, ChargeCodeCategory		=	cast(string_agg(distinct cast(fmc.[DESCRIPTION]	as varchar(max))	, ', ')	as varchar(500))
 			, CurrencyCode				=	cast(j.CURRCODE													as varchar(50))
-			, AmountFC					=	sum(try_cast(j.AMTFC											as float))
-			, AmountLC					=	sum(try_cast(j.AMTLC											as float))
-			, ActualAmountFC			=	sum(try_cast(j.ACTUALAMTBC										as float))
-			, ActualAmountLC			=	sum(try_cast(j.ACTUALAMTLC										as float))
-			, RecognitionAmountFC		=	sum(j.RecognitionAmountFC)
-			, RecognitionAmountLC		=	sum(try_cast(j.RECOGNITIONAMTLC									as float))
-			, VATAmountFC				=	cast(null														as float)	--no confirmed source column on TMFF_REVENUE/TMFF_COST
-			, VATAmountLC				=	cast(null														as float)	--no confirmed "booked" (non-actual) VAT column on TMFF_REVENUE/TMFF_COST
-			, VATActualAmountFC			=	cast(null														as float)	--no confirmed source column on TMFF_REVENUE/TMFF_COST
-			, VATActualAmountLC			=	sum(try_cast(j.ACTUALVATAMTLC										as float))
-			, CreditorCode				=	cast(case when j.ChargeType = 'COST' then party.PARTYID end	as varchar(50))
+			, AmountFC					=	sum(try_cast(j.AmountFC											as float))
+			, AmountLC					=	sum(try_cast(j.AmountLC											as float))
+			, ActualAmountFC			=	sum(try_cast(j.ActualAmountFC									as float))
+			, ActualAmountLC			=	sum(try_cast(j.ActualAmountLC									as float))
+			, RecognitionAmountFC		=	sum(try_cast(RecognitionAmountFC								as float))
+			, RecognitionAmountLC		=	sum(try_cast(j.RecognitionAmountLC								as float))
+			, VATAmountFC				=	sum(cast(VATAmountFC											as float))
+			, VATAmountLC				=	sum(cast(VATAmountLC											as float))
+			, VATActualAmountFC			=	sum(try_cast(j.VATActualAmountFC								as float))
+			, VATActualAmountLC			=	sum(try_cast(j.VATActualAmountLC								as float))
+			, CreditorCode				=	cast(case when j.ChargeType = 'COST' then party.PARTYID end		as varchar(50))
 			, CreditorName				=	cast(case when j.ChargeType = 'COST' then party.FULLNAME end	as varchar(150))
 			, DebtorCode				=	cast(case when j.ChargeType = 'REVENUE' then party.PARTYID end	as varchar(50))
 			, DebtorName				=	cast(case when j.ChargeType = 'REVENUE' then party.FULLNAME end	as varchar(150))
-			, VendorType				=	cast(null														as varchar(50))	--no confirmed source column for TMFF or OPS
+			, VendorType				=	cast(null														as varchar(50))
 from		(
-			select		  jsid.UNID
-						, jsid.GSHPID
+			select		  jsid.GSHPID
 						, src.SNO
 						, src.ChargeType
 						, src.CHRGCODE
-						, src.AMTFC
-						, src.AMTLC
-						, src.ACTUALAMTBC
-						, src.ACTUALAMTLC
-						, src.ACTUALVATAMTLC
+						, src.AmountFC
+						, src.AmountLC
+						, src.ActualAmountFC
+						, src.ActualAmountLC
+						, src.VATActualAmountFC
+						, src.VATActualAmountLC
+						, src.VATAmountFC
+						, src.VATAmountLC
+						, src.RecognitionAmountFC
+						, src.RecognitionAmountLC
 						, src.CURRCODE
 						, src.ACTUALCURRCODE
-						, src.RECOGNITIONAMTLC
-						, src.RecognitionAmountFC
 						, src.PartyId
 						, jsid.BIZTYPE
 						, JOB_UNID				=	jsid.UNID
@@ -61,39 +63,45 @@ from		(
 									, SNO					=	r.SNO
 									, ChargeType			=	cast('REVENUE' as varchar(10))
 									, CHRGCODE				=	r.CHRGCODE
-									, AMTFC					=	r.AMTFC
-									, AMTLC					=	r.AMTLC
-									, ACTUALAMTBC			=	r.ACTUALAMTBC
-									, ACTUALAMTLC			=	r.ACTUALAMTLC
-									, ACTUALVATAMTLC		=	r.ACTUALVATAMTLC
+									, AmountFC				=	r.AMTFC
+									, AmountLC				=	r.AMTLC
+									, ActualAmountFC		=	r.ACTUALAMTBC
+									, ActualAmountLC		=	r.ACTUALAMTLC
+									, VATActualAmountFC		=	r.ACTUALVATAMTBC
+									, VATActualAmountLC		=	r.ACTUALVATAMTLC
+									, VATAmountFC			=	r.ACTUALVATAMTBC
+									, VATAmountLC			=	r.VATAMTLC --VATAMT
+									, RecognitionAmountFC	=	try_cast(r.RECOGNITIONAMTLC * (r.AMTFC / nullif(r.AMTLC, 0))	as float)
+									, RecognitionAmountLC	=	r.RECOGNITIONAMTLC
 									, CURRCODE				=	r.CURRCODE
 									, ACTUALCURRCODE		=	r.ACTUALCURRCODE
-									, RECOGNITIONAMTLC		=	r.RECOGNITIONAMTLC
-									, RecognitionAmountFC	=	try_cast(r.RECOGNITIONAMTLC * (r.AMTFC / nullif(r.AMTLC, 0))	as float)
 									, PartyId				=	r.BILLING_PARTYID
 						from		ODS.TMFF_REVENUE r
 						where		r.SCD_ActiveFlag = 1
 						and			r.SCD_IsDeleted = 0
-						and			isnull(r.INVSTS, '') not in ('C', 'V')	--exclude voided/credited lines, replaced by new charge lines (per CALC.v_TMFF_RecognitionEvents convention)
+						and			isnull(r.INVSTS, '') not in ('C', 'V')
 						union all
 						select		  JOB_UNID				=	c.JOB_UNID
 									, SNO					=	c.SNO
 									, ChargeType			=	cast('COST' as varchar(10))
 									, CHRGCODE				=	c.CHRGCODE
-									, AMTFC					=	c.AMTFC
-									, AMTLC					=	c.AMTLC
-									, ACTUALAMTBC			=	c.ACTUALAMTBC
-									, ACTUALAMTLC			=	c.ACTUALAMTLC
-									, ACTUALVATAMTLC		=	c.ACTUALVATAMTLC
+									, AmountFC				=	c.AMTFC
+									, AmountLC				=	c.AMTLC
+									, ActualAmountFC		=	c.ACTUALAMTBC
+									, ActualAmountLC		=	c.ACTUALAMTLC
+									, VATActualAmountFC		=	c.ACTUALVATAMTBC
+									, VATActualAmountLC		=	c.ACTUALVATAMTLC
+									, VATAmountFC			=	c.ACTUALVATAMTBC
+									, VATAmountLC			=	c.VATAMTLC
+									, RecognitionAmountFC	=	try_cast(c.RECOGNITIONAMTLC * (c.AMTFC / nullif(c.AMTLC, 0))	as float)
+									, RecognitionAmountLC	=	c.RECOGNITIONAMTLC
 									, CURRCODE				=	c.CURRCODE
 									, ACTUALCURRCODE		=	c.ACTUALCURRCODE
-									, RECOGNITIONAMTLC		=	c.RECOGNITIONAMTLC
-									, RecognitionAmountFC	=	try_cast(c.RECOGNITIONAMTLC * (c.AMTFC / nullif(c.AMTLC, 0))	as float)
 									, PartyId				=	c.PAYEE_PARTYID
 						from		ODS.TMFF_COST c
 						where		c.SCD_ActiveFlag = 1
 						and			c.SCD_IsDeleted = 0
-						and			isnull(c.INVSTS, '') not in ('C', 'V')	--exclude voided/credited lines, replaced by new charge lines (per CALC.v_TMFF_RecognitionEvents convention)
+						and			isnull(c.INVSTS, '') not in ('C', 'V')
 						) src
 			join		ODS.TMFF_JOB jsid
 			on			jsid.UNID = src.JOB_UNID
@@ -133,6 +141,7 @@ group by	  j.JOB_UNID
 			, cast(case when j.ChargeType = 'REVENUE' then party.FULLNAME end	as varchar(150))
 
 
+
 union all
 
 
@@ -140,71 +149,67 @@ select		  JOB_UNID					=	cast(a.rowguid_AWB												as varchar(50))
 			, System_BK					=	cast('OPS'														as varchar(50))
 			, ShipmentID				=	cast(left(a.HWB, 11)											as varchar(50))
 			, ChargeType				=	cast(a.ChargeType												as varchar(10))
-			, ChargeCode				=	cast(string_agg(cast(a.ChrgCode as varchar(max)), ', ')			as varchar(200))
-			, ChargeCodeDescription		=	cast(string_agg(cast(a.ChrgDesc as varchar(max)), ', ')			as varchar(500))
-			, ChargeCodeCategory		=	cast(string_agg(cast(cc.ReportsCategory as varchar(max)), ', ')	as varchar(500))
+			, ChargeCode				=	cast(string_agg(distinct cast(a.ChrgCode	as varchar(max))	, ', ')		as varchar(500))
+			, ChargeCodeDescription		=	cast(string_agg(distinct cast(a.ChrgDesc	as varchar(max))	, ', ')		as varchar(500))
+			, ChargeCodeCategory		=	cast(string_agg(distinct cast(cc.ReportsCategory	as varchar(max))	, ', ')	as varchar(500))
 			, CurrencyCode				=	cast(coalesce(cur.CurrencyType, 'USD')							as varchar(50))
 			, AmountFC					=	sum(try_cast(coalesce(a.ForeignAmt, a.Amount)					as float))
 			, AmountLC					=	sum(try_cast(a.Amount											as float))
-			, ActualAmountFC			=	cast(null														as float)	--OPS has no separate booked/actual split; Amount is already the actual charge
+			, ActualAmountFC			=	cast(null														as float)
 			, ActualAmountLC			=	cast(null														as float)
-			, RecognitionAmountFC		=	cast(null														as float)	--no revenue-recognition concept confirmed for OPS
+			, RecognitionAmountFC		=	cast(null														as float)
 			, RecognitionAmountLC		=	cast(null														as float)
-			, VATAmountFC				=	cast(null														as float)	--no confirmed source column
-			, VATAmountLC				=	sum(try_cast(case when a.ChargeType = 'REVENUE' then a.TaxAndDutyAmountTransaction_BI end	as float))	--tblAWBCost has no VAT/tax column
+			, VATAmountFC				=	cast(null														as float)
+			, VATAmountLC				=	sum(try_cast(case when a.ChargeType = 'REVENUE' then a.TaxAndDutyAmountTransaction_BI end	as float))
 			, VATActualAmountFC			=	cast(null														as float)
-			, VATActualAmountLC			=	cast(null														as float)	--OPS has no separate booked/actual split for VAT
+			, VATActualAmountLC			=	cast(null														as float)
 			, CreditorCode				=	cast(case when a.ChargeType = 'COST' then pty.AccountNo end	as varchar(50))
 			, CreditorName				=	cast(case when a.ChargeType = 'COST' then pty.NameFull end	as varchar(150))
 			, DebtorCode				=	cast(case when a.ChargeType = 'REVENUE' then cust.CustNo end	as varchar(50))
 			, DebtorName				=	cast(case when a.ChargeType = 'REVENUE' then cust.CustName end	as varchar(150))
-			, VendorType				=	cast(null														as varchar(50))	--no confirmed source column for TMFF or OPS
+			, VendorType				=	cast(null														as varchar(50))
 from		(
-			select		  a.rowguid_AWB
+			select		  rowguid_AWB						=	d.rowguid_AWB
 						, a.HWB
-						, src.ChargeType
-						, src.ChrgCode
-						, src.ChrgDesc
-						, src.Amount
-						, src.ForeignAmt
-						, src.TaxAndDutyAmountTransaction_BI
-						, src.rowguid_Currency
-						, src.rowguid_Vendor
-						, src.rowguid_AWBInvoice
-			from		(
-						select		  rowguid_AWB						=	d.rowguid_AWB
-									, ChargeType						=	cast('REVENUE' as varchar(10))
-									, ChrgCode							=	d.ChrgCode
-									, ChrgDesc							=	d.ChrgDesc
-									, Amount							=	d.Amount
-									, ForeignAmt						=	d.ForeignAmt
-									, TaxAndDutyAmountTransaction_BI	=	d.TaxAndDutyAmountTransaction_BI
-									, rowguid_Currency					=	d.rowguid_Currency
-									, rowguid_Vendor					=	cast(null as uniqueidentifier)
-									, rowguid_AWBInvoice				=	d.rowguid_AWBInvoice
-						from		ODS.NORAMOPSDW_tblAWBInvoiceDetail d
-						where		d.SCD_ActiveFlag = 1
-						and			d.SCD_IsDeleted = 0
-						union all
-						select		  rowguid_AWB						=	c.rowguid_AWB
-									, ChargeType						=	cast('COST' as varchar(10))
-									, ChrgCode							=	c.ChrgCode
-									, ChrgDesc							=	c.ChrgDesc
-									, Amount							=	c.Amount
-									, ForeignAmt						=	c.ForeignAmt
-									, TaxAndDutyAmountTransaction_BI	=	cast(null as money)
-									, rowguid_Currency					=	c.rowguid_Currency
-									, rowguid_Vendor					=	c.rowguid_Vendor
-									, rowguid_AWBInvoice				=	cast(null as uniqueidentifier)
-						from		ODS.NORAMOPSDW_tblAWBCost c
-						where		c.SCD_ActiveFlag = 1
-						and			c.SCD_IsDeleted = 0
-						) src
+						, ChargeType						=	cast('REVENUE' as varchar(10))
+						, ChrgCode							=	d.ChrgCode
+						, ChrgDesc							=	d.ChrgDesc
+						, Amount							=	cast(d.Amount as money)
+						, ForeignAmt						=	cast(d.ForeignAmt as money)
+						, TaxAndDutyAmountTransaction_BI	=	d.TaxAndDutyAmountTransaction_BI
+						, rowguid_Currency					=	d.rowguid_Currency
+						, rowguid_Vendor					=	cast(null as uniqueidentifier)
+						, rowguid_AWBInvoice				=	d.rowguid_AWBInvoice
+			from		ODS.NORAMOPSDW_tblAWBInvoiceDetail d
 			join		ODS.NORAMOPSDW_tblAWB a
-			on			a.rowguid_AWB = src.rowguid_AWB
+			on			a.rowguid_AWB = d.rowguid_AWB
 			and			a.SCD_ActiveFlag = 1
 			and			a.SCD_IsDeleted = 0
 			and			a.LinkServer = 'TGOPSINTL'
+			where		d.SCD_ActiveFlag = 1
+			and			d.SCD_IsDeleted = 0
+
+			union all
+
+			select		  rowguid_AWB						=	c.rowguid_AWB
+						, a.HWB
+						, ChargeType						=	cast('COST' as varchar(10))
+						, ChrgCode							=	cast(c.ChrgCode as varchar(100))
+						, ChrgDesc							=	cast(c.ChrgDesc as varchar(500))
+						, Amount							=	cast(c.Amount as money)
+						, ForeignAmt						=	cast(c.ForeignAmt as money)
+						, TaxAndDutyAmountTransaction_BI	=	cast(null as money)
+						, rowguid_Currency					=	c.rowguid_Currency
+						, rowguid_Vendor					=	c.rowguid_Vendor
+						, rowguid_AWBInvoice				=	cast(null as uniqueidentifier)
+			from		ODS.NORAMOPSDW_tblAWBCost c
+			join		ODS.NORAMOPSDW_tblAWB a
+			on			a.rowguid_AWB = c.rowguid_AWB
+			and			a.SCD_ActiveFlag = 1
+			and			a.SCD_IsDeleted = 0
+			and			a.LinkServer = 'TGOPSINTL'
+			where		c.SCD_ActiveFlag = 1
+			and			c.SCD_IsDeleted = 0
 			) a
 left join	ODS.NORAMOPSDW_lkpChargeCode cc
 on			cc.ChrgCode = a.ChrgCode
@@ -212,7 +217,7 @@ and			cc.LinkServer = 'TGOPSINTL'
 left join	ODS.NORAMOPSDW_lkpCurrency cur
 on			cur.rowguid_Currency = a.rowguid_Currency
 and			cur.LinkServer = 'TGOPSINTL'
-left join	ODS.NORAMOPSDW_tblAWBInvoice ai		--revenue-only header, for Debtor/Customer
+left join	ODS.NORAMOPSDW_tblAWBInvoice ai
 on			ai.rowguid_AWBInvoice = a.rowguid_AWBInvoice
 and			ai.SCD_ActiveFlag = 1
 and			ai.SCD_IsDeleted = 0
@@ -220,18 +225,18 @@ left join	ODS.NORAMOPSDW_tblCustomer cust
 on			cust.rowguid_Customer = ai.rowguid_Customer
 and			cust.SCD_ActiveFlag = 1
 and			cust.SCD_IsDeleted = 0
-left join	ODS.NORAMOPSDW_tblShipmentParty sp		--cost-only, vendor-to-party bridge
+left join	ODS.NORAMOPSDW_tblShipmentParty sp
 on			sp.RowID = a.rowguid_Vendor
 and			sp.SCD_ActiveFlag = 1
 and			sp.SCD_IsDeleted = 0
 left join	CALC.v_NORAMOPSDW_Party pty
 on			pty.OriginalParty_BK = sp.Party_BK
 group by	  a.rowguid_AWB
-			, a.HWB
+			, left(a.HWB, 11)
 			, a.ChargeType
 			, coalesce(cur.CurrencyType, 'USD')
-			, cast(case when a.ChargeType = 'COST' then pty.AccountNo end		as varchar(50))
-			, cast(case when a.ChargeType = 'COST' then pty.NameFull end		as varchar(150))
-			, cast(case when a.ChargeType = 'REVENUE' then cust.CustNo end	as varchar(50))
-			, cast(case when a.ChargeType = 'REVENUE' then cust.CustName end	as varchar(150))
+			, case when a.ChargeType = 'COST' then pty.AccountNo end
+			, case when a.ChargeType = 'COST' then pty.NameFull end
+			, case when a.ChargeType = 'REVENUE' then cust.CustNo end
+			, case when a.ChargeType = 'REVENUE' then cust.CustName end
 GO
