@@ -236,10 +236,8 @@ from		(
 left join	ODS.NORAMOPSDW_lkpCurrency cur
 on			cur.rowguid_Currency = a.rowguid_Currency
 and			cur.LinkServer = 'TGOPSINTL'
-left join	ODS.NORAMOPSDW_tblAWBInvoice ai
+left join	ODS.NORAMOPSDW_tblAWBInvoice ai		--resolves rowguid_AWBInvoice to the customer's rowguid; no SCD filter here since this specific historical invoice row may since have been superseded (matches InvoiceDetails.sql's ivh join)
 on			ai.rowguid_AWBInvoice = a.rowguid_AWBInvoice
-and			ai.SCD_ActiveFlag = 1
-and			ai.SCD_IsDeleted = 0
 left join	ODS.NORAMOPSDW_tblCustomer cust
 on			cust.rowguid_Customer = ai.rowguid_Customer
 and			cust.SCD_ActiveFlag = 1

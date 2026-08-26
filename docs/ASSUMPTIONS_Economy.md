@@ -50,15 +50,32 @@ and pure redundant work).
      pattern as `custp` in `v_Shipment`.
    - OPS Debtor (revenue only): `tblAWBInvoice.rowguid_Customer → tblCustomer.CustNo/CustName`.
    - OPS Creditor (cost only): `tblAWBCost.rowguid_Vendor → tblShipmentParty.RowID →
-     Party_BK → CALC.v_NORAMOPSDW_Party.AccountNo/NameFull` — using the CALC-layer party
-     resolution (as instructed, richer than a raw lookup) instead of `lkpVendor` directly.
+     Party_BK → (latest active tblShipmentParty row for that Party_BK).AccountNo/NameFull`.
+     This inlines `CALC.v_NORAMOPSDW_Party`'s own dedup logic directly on ODS tables — no
+     `CALC.*` reference in the view — per your instruction that Reports views must not
+     depend on CALC objects, only reuse their logic.
    **Open question:** the Excel spec says Creditor should come from `LU_VENDOR.VendorNo/
    VendorName` directly. `lkpVendor` (confirmed via `v_Shipment`'s carrier lookup) only
-   has `rowguid_Vendor, VendorNo, VendorName` — no richer info than `CALC.v_NORAMOPSDW_Party`
-   provides, and the production `v_NORAMOPSDW_dim_Party` view itself resolves AWBCost's
-   creditor through `tblShipmentParty`/`CALC` rather than `lkpVendor`. I followed that
-   established path — flag if you'd rather I use `lkpVendor.VendorNo/VendorName` instead
-   (simpler, but not how any existing production view resolves this).
+   has `rowguid_Vendor, VendorNo, VendorName` — no richer info than the tblShipmentParty
+   path provides, and the production `v_NORAMOPSDW_dim_Party` view itself resolves AWBCost's
+   creditor through `tblShipmentParty` rather than `lkpVendor`. I followed that established
+   path — flag if you'd rather use `lkpVendor.VendorNo/VendorName` instead (simpler, but not
+   how any existing production view resolves this).
+
+9. **SCD filter must not sit on the intermediate hop of a two-table lookup chain** —
+   confirmed as a real, live bug via actual sample output (AWB `01AA8A63-...`), not just a
+   theoretical concern. Pattern: `tblAWBCost.rowguid_Vendor`/`tblAWBInvoiceDetail.rowguid_AWBInvoice`
+   are FKs captured *at the time that cost/invoice-detail row was recorded* — they point at
+   one specific historical row in `tblShipmentParty`/`tblAWBInvoice`. If that specific row has
+   since been superseded by a newer SCD version (a very normal occurrence), it is no longer
+   `SCD_ActiveFlag=1`. Filtering the *first* hop (`sp`/`ai`) by `SCD_ActiveFlag=1` at that
+   point therefore silently drops the join entirely, well before we ever get a chance to
+   re-resolve to the business key's current version — producing NULL Creditor/Debtor even
+   though the party genuinely exists and is active under a different row. Confirmed correct
+   by cross-checking `InvoiceDetails.sql`'s own `ivh` (`tblAWBInvoice`) join, which has **no**
+   SCD filter at all — the filter only appears on the *final* lookup (`cust`). Fixed by
+   removing the SCD filter from `sp` and `ai` (the intermediate hops); it stays only on the
+   terminal lookups (`pty`'s inner dedup subquery, and `cust`).
 
    **Deliberate deviation from `InvoiceDetails.sql` for TMFF Debtor/Creditor:**
    `InvoiceDetails.sql` resolves TMFF Debtor from `TMFF_IVHDR.PARTYID_CUST`/`CUSTNAME` (the
