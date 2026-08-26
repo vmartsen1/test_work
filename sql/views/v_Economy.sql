@@ -55,7 +55,7 @@ from		(
 						, RecognitionAmountFC	=	sum(src.RecognitionAmountFC)
 						, RecognitionAmountLC	=	sum(src.RecognitionAmountLC)
 						, CURRCODE				=	src.CURRCODE
-						, PartyId				=	max(src.PartyId)	--resolve to one value per (Job,ChargeType,ChargeCode,Currency); some lines carry a NULL PartyId, MAX() picks the real one instead of splitting into an extra row
+						, src.PartyId
 						, src.JOB_UNID
 			from		(
 						select		  JOB_UNID				=	r.JOB_UNID
@@ -118,6 +118,7 @@ from		(
 						, fmcc.CHRGDESC
 						, fmc.[DESCRIPTION]
 						, src.CURRCODE
+						, src.PartyId
 						, src.JOB_UNID
 			) j
 left join	(
@@ -182,7 +183,7 @@ from		(
 						, TaxAndDutyAmountTransaction_BI	=	sum(d.TaxAndDutyAmountTransaction_BI)
 						, rowguid_Currency					=	d.rowguid_Currency
 						, rowguid_Vendor					=	cast(null as uniqueidentifier)
-						, rowguid_AWBInvoice				=	max(d.rowguid_AWBInvoice)	--resolve to one value per (AWB,ChargeCode,Currency); guards the same NULL-vs-value split as rowguid_Vendor below, even though tblAWBInvoiceDetail's FK is normally always populated
+						, rowguid_AWBInvoice				=	d.rowguid_AWBInvoice
 			from		ODS.NORAMOPSDW_tblAWBInvoiceDetail d
 			join		ODS.NORAMOPSDW_tblAWB a
 			on			a.rowguid_AWB = d.rowguid_AWB
@@ -200,6 +201,7 @@ from		(
 						, d.ChrgDesc
 						, cc.ReportsCategory
 						, d.rowguid_Currency
+						, d.rowguid_AWBInvoice
 
 			union all
 
@@ -213,7 +215,7 @@ from		(
 						, ForeignAmt						=	sum(cast(c.ForeignAmt as money))
 						, TaxAndDutyAmountTransaction_BI	=	cast(null as money)
 						, rowguid_Currency					=	c.rowguid_Currency
-						, rowguid_Vendor					=	max(c.rowguid_Vendor)	--resolve to one value per (AWB,ChargeCode,Currency); some lines carry a NULL vendor, MAX() picks the real one instead of splitting into an extra row
+						, rowguid_Vendor					=	c.rowguid_Vendor
 						, rowguid_AWBInvoice				=	cast(null as uniqueidentifier)
 			from		ODS.NORAMOPSDW_tblAWBCost c
 			join		ODS.NORAMOPSDW_tblAWB a
@@ -232,6 +234,7 @@ from		(
 						, c.ChrgDesc
 						, cc.ReportsCategory
 						, c.rowguid_Currency
+						, c.rowguid_Vendor
 			) a
 left join	ODS.NORAMOPSDW_lkpCurrency cur
 on			cur.rowguid_Currency = a.rowguid_Currency
