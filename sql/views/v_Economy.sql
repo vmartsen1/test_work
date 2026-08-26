@@ -33,10 +33,10 @@ select		  JOB_UNID					=	cast(lvl1.JOB_UNID												as varchar(50))
 			, VATAmountLC				=	sum(lvl1.VATAmountLC)
 			, VATActualAmountFC			=	sum(lvl1.VATActualAmountFC)
 			, VATActualAmountLC			=	sum(lvl1.VATActualAmountLC)
-			, CreditorCode				=	cast(case when lvl1.ChargeType = 'COST' then lvl1.PARTYID end		as varchar(50))
-			, CreditorName				=	cast(case when lvl1.ChargeType = 'COST' then lvl1.FULLNAME end	as varchar(150))
-			, DebtorCode				=	cast(case when lvl1.ChargeType = 'REVENUE' then lvl1.PARTYID end	as varchar(50))
-			, DebtorName				=	cast(case when lvl1.ChargeType = 'REVENUE' then lvl1.FULLNAME end	as varchar(150))
+			, CreditorCode				=	cast(case when lvl1.ChargeType = 'COST' then party.PARTYID end		as varchar(50))
+			, CreditorName				=	cast(case when lvl1.ChargeType = 'COST' then party.FULLNAME end	as varchar(150))
+			, DebtorCode				=	cast(case when lvl1.ChargeType = 'REVENUE' then party.PARTYID end	as varchar(50))
+			, DebtorName				=	cast(case when lvl1.ChargeType = 'REVENUE' then party.FULLNAME end	as varchar(150))
 			, VendorType				=	cast(null														as varchar(50))
 from		(
 			select		  j.JOB_UNID
@@ -46,8 +46,7 @@ from		(
 						, CHRGDESC				=	fmcc.CHRGDESC
 						, CategoryDescription	=	fmc.[DESCRIPTION]
 						, j.CURRCODE
-						, party.PARTYID
-						, party.FULLNAME
+						, PartyId				=	max(j.PartyId)		--resolve to one value per (Job,ChargeType,ChargeCode,Currency) before joining party; some lines carry a NULL PartyId, MAX() picks the real one instead of splitting into an extra row
 						, AmountFC				=	sum(try_cast(j.AmountFC								as float))
 						, AmountLC				=	sum(try_cast(j.AmountLC								as float))
 						, ActualAmountFC		=	sum(try_cast(j.ActualAmountFC							as float))
@@ -131,19 +130,6 @@ from		(
 						on			sycw.OWNERID = jsid.OWNERID
 						and			sycw.CTRYCODE = 'US'
 						) j
-			left join	(
-						select		*
-						from		(
-									select		  PARTYID
-												, FULLNAME
-												, rn	=	row_number() over (partition by PARTYID order by SCD_UpdateDate desc)
-									from		ODS.TMFF_FMPARTY
-									where		SCD_ActiveFlag = 1
-									and			SCD_IsDeleted = 0
-									) x
-						where		rn = 1
-						) party
-			on			party.PARTYID = j.PartyId
 			left join	ODS.TMFF_FMCHARGECODE fmcc
 			on			fmcc.CHRGCODE = j.CHRGCODE
 			and			fmcc.BIZTYPE = j.BIZTYPE
@@ -158,17 +144,28 @@ from		(
 						, fmcc.CHRGDESC
 						, fmc.[DESCRIPTION]
 						, j.CURRCODE
-						, party.PARTYID
-						, party.FULLNAME
 			) lvl1
+left join	(
+			select		*
+			from		(
+						select		  PARTYID
+									, FULLNAME
+									, rn	=	row_number() over (partition by PARTYID order by SCD_UpdateDate desc)
+						from		ODS.TMFF_FMPARTY
+						where		SCD_ActiveFlag = 1
+						and			SCD_IsDeleted = 0
+						) x
+			where		rn = 1
+			) party
+on			party.PARTYID = lvl1.PartyId
 group by	  lvl1.JOB_UNID
 			, lvl1.GSHPID
 			, lvl1.ChargeType
 			, lvl1.CURRCODE
-			, cast(case when lvl1.ChargeType = 'COST' then lvl1.PARTYID end		as varchar(50))
-			, cast(case when lvl1.ChargeType = 'COST' then lvl1.FULLNAME end	as varchar(150))
-			, cast(case when lvl1.ChargeType = 'REVENUE' then lvl1.PARTYID end	as varchar(50))
-			, cast(case when lvl1.ChargeType = 'REVENUE' then lvl1.FULLNAME end	as varchar(150))
+			, cast(case when lvl1.ChargeType = 'COST' then party.PARTYID end		as varchar(50))
+			, cast(case when lvl1.ChargeType = 'COST' then party.FULLNAME end	as varchar(150))
+			, cast(case when lvl1.ChargeType = 'REVENUE' then party.PARTYID end	as varchar(50))
+			, cast(case when lvl1.ChargeType = 'REVENUE' then party.FULLNAME end	as varchar(150))
 
 
 
@@ -193,10 +190,10 @@ select		  JOB_UNID					=	cast(lvl1.rowguid_AWB											as varchar(50))
 			, VATAmountLC				=	sum(lvl1.VATAmountLC)
 			, VATActualAmountFC			=	cast(null														as float)
 			, VATActualAmountLC			=	cast(null														as float)
-			, CreditorCode				=	cast(case when lvl1.ChargeType = 'COST' then lvl1.AccountNo end	as varchar(50))
-			, CreditorName				=	cast(case when lvl1.ChargeType = 'COST' then lvl1.NameFull end	as varchar(150))
-			, DebtorCode				=	cast(case when lvl1.ChargeType = 'REVENUE' then lvl1.CustNo end	as varchar(50))
-			, DebtorName				=	cast(case when lvl1.ChargeType = 'REVENUE' then lvl1.CustName end	as varchar(150))
+			, CreditorCode				=	cast(case when lvl1.ChargeType = 'COST' then pty.AccountNo end	as varchar(50))
+			, CreditorName				=	cast(case when lvl1.ChargeType = 'COST' then pty.NameFull end	as varchar(150))
+			, DebtorCode				=	cast(case when lvl1.ChargeType = 'REVENUE' then cust.CustNo end	as varchar(50))
+			, DebtorName				=	cast(case when lvl1.ChargeType = 'REVENUE' then cust.CustName end	as varchar(150))
 			, VendorType				=	cast(null														as varchar(50))
 from		(
 			select		  a.rowguid_AWB
@@ -206,55 +203,72 @@ from		(
 						, a.ChrgDesc
 						, cc.ReportsCategory
 						, CurrencyCode		=	coalesce(cur.CurrencyType, 'USD')
-						, pty.AccountNo
-						, pty.NameFull
-						, cust.CustNo
-						, cust.CustName
+						, a.rowguid_AWBInvoice
+						, a.rowguid_Vendor
 						, AmountFC			=	sum(try_cast(coalesce(a.ForeignAmt, a.Amount)					as float))
 						, AmountLC			=	sum(try_cast(a.Amount											as float))
 						, VATAmountLC		=	sum(try_cast(case when a.ChargeType = 'REVENUE' then a.TaxAndDutyAmountTransaction_BI end	as float))
 			from		(
-						select		  rowguid_AWB						=	d.rowguid_AWB
-									, a.HWB
-									, ChargeType						=	cast('REVENUE' as varchar(10))
-									, ChrgCode							=	d.ChrgCode
-									, ChrgDesc							=	d.ChrgDesc
-									, Amount							=	cast(d.Amount as money)
-									, ForeignAmt						=	cast(d.ForeignAmt as money)
-									, TaxAndDutyAmountTransaction_BI	=	d.TaxAndDutyAmountTransaction_BI
-									, rowguid_Currency					=	d.rowguid_Currency
-									, rowguid_Vendor					=	cast(null as uniqueidentifier)
-									, rowguid_AWBInvoice				=	d.rowguid_AWBInvoice
-						from		ODS.NORAMOPSDW_tblAWBInvoiceDetail d
-						join		ODS.NORAMOPSDW_tblAWB a
-						on			a.rowguid_AWB = d.rowguid_AWB
-						and			a.SCD_ActiveFlag = 1
-						and			a.SCD_IsDeleted = 0
-						and			a.LinkServer = 'TGOPSINTL'
-						where		d.SCD_ActiveFlag = 1
-						and			d.SCD_IsDeleted = 0
+						select		  rowguid_AWB						=	src.rowguid_AWB
+									, src.HWB
+									, src.ChargeType
+									, src.ChrgCode
+									, src.ChrgDesc
+									, rowguid_Currency					=	src.rowguid_Currency
+									, rowguid_Vendor					=	max(src.rowguid_Vendor)			--resolve to one value per (AWB,ChargeType,ChargeCode,Currency); some lines carry a NULL vendor, MAX() picks the real one instead of splitting into an extra row
+									, rowguid_AWBInvoice				=	max(src.rowguid_AWBInvoice)		--same resolution for the revenue side's invoice link
+									, ForeignAmt						=	sum(src.ForeignAmt)
+									, Amount							=	sum(src.Amount)
+									, TaxAndDutyAmountTransaction_BI	=	sum(src.TaxAndDutyAmountTransaction_BI)
+						from		(
+									select		  rowguid_AWB						=	d.rowguid_AWB
+												, a.HWB
+												, ChargeType						=	cast('REVENUE' as varchar(10))
+												, ChrgCode							=	d.ChrgCode
+												, ChrgDesc							=	d.ChrgDesc
+												, Amount							=	cast(d.Amount as money)
+												, ForeignAmt						=	cast(d.ForeignAmt as money)
+												, TaxAndDutyAmountTransaction_BI	=	d.TaxAndDutyAmountTransaction_BI
+												, rowguid_Currency					=	d.rowguid_Currency
+												, rowguid_Vendor					=	cast(null as uniqueidentifier)
+												, rowguid_AWBInvoice				=	d.rowguid_AWBInvoice
+									from		ODS.NORAMOPSDW_tblAWBInvoiceDetail d
+									join		ODS.NORAMOPSDW_tblAWB a
+									on			a.rowguid_AWB = d.rowguid_AWB
+									and			a.SCD_ActiveFlag = 1
+									and			a.SCD_IsDeleted = 0
+									and			a.LinkServer = 'TGOPSINTL'
+									where		d.SCD_ActiveFlag = 1
+									and			d.SCD_IsDeleted = 0
 
-						union all
+									union all
 
-						select		  rowguid_AWB						=	c.rowguid_AWB
-									, a.HWB
-									, ChargeType						=	cast('COST' as varchar(10))
-									, ChrgCode							=	cast(c.ChrgCode as varchar(100))
-									, ChrgDesc							=	cast(c.ChrgDesc as varchar(500))
-									, Amount							=	cast(c.Amount as money)
-									, ForeignAmt						=	cast(c.ForeignAmt as money)
-									, TaxAndDutyAmountTransaction_BI	=	cast(null as money)
-									, rowguid_Currency					=	c.rowguid_Currency
-									, rowguid_Vendor					=	c.rowguid_Vendor
-									, rowguid_AWBInvoice				=	cast(null as uniqueidentifier)
-						from		ODS.NORAMOPSDW_tblAWBCost c
-						join		ODS.NORAMOPSDW_tblAWB a
-						on			a.rowguid_AWB = c.rowguid_AWB
-						and			a.SCD_ActiveFlag = 1
-						and			a.SCD_IsDeleted = 0
-						and			a.LinkServer = 'TGOPSINTL'
-						where		c.SCD_ActiveFlag = 1
-						and			c.SCD_IsDeleted = 0
+									select		  rowguid_AWB						=	c.rowguid_AWB
+												, a.HWB
+												, ChargeType						=	cast('COST' as varchar(10))
+												, ChrgCode							=	cast(c.ChrgCode as varchar(100))
+												, ChrgDesc							=	cast(c.ChrgDesc as varchar(500))
+												, Amount							=	cast(c.Amount as money)
+												, ForeignAmt						=	cast(c.ForeignAmt as money)
+												, TaxAndDutyAmountTransaction_BI	=	cast(null as money)
+												, rowguid_Currency					=	c.rowguid_Currency
+												, rowguid_Vendor					=	c.rowguid_Vendor
+												, rowguid_AWBInvoice				=	cast(null as uniqueidentifier)
+									from		ODS.NORAMOPSDW_tblAWBCost c
+									join		ODS.NORAMOPSDW_tblAWB a
+									on			a.rowguid_AWB = c.rowguid_AWB
+									and			a.SCD_ActiveFlag = 1
+									and			a.SCD_IsDeleted = 0
+									and			a.LinkServer = 'TGOPSINTL'
+									where		c.SCD_ActiveFlag = 1
+									and			c.SCD_IsDeleted = 0
+									) src
+						group by	  src.rowguid_AWB
+									, src.HWB
+									, src.ChargeType
+									, src.ChrgCode
+									, src.ChrgDesc
+									, src.rowguid_Currency
 						) a
 			left join	ODS.NORAMOPSDW_lkpChargeCode cc
 			on			cc.ChrgCode = a.ChrgCode
@@ -262,20 +276,6 @@ from		(
 			left join	ODS.NORAMOPSDW_lkpCurrency cur
 			on			cur.rowguid_Currency = a.rowguid_Currency
 			and			cur.LinkServer = 'TGOPSINTL'
-			left join	ODS.NORAMOPSDW_tblAWBInvoice ai
-			on			ai.rowguid_AWBInvoice = a.rowguid_AWBInvoice
-			and			ai.SCD_ActiveFlag = 1
-			and			ai.SCD_IsDeleted = 0
-			left join	ODS.NORAMOPSDW_tblCustomer cust
-			on			cust.rowguid_Customer = ai.rowguid_Customer
-			and			cust.SCD_ActiveFlag = 1
-			and			cust.SCD_IsDeleted = 0
-			left join	ODS.NORAMOPSDW_tblShipmentParty sp
-			on			sp.RowID = a.rowguid_Vendor
-			and			sp.SCD_ActiveFlag = 1
-			and			sp.SCD_IsDeleted = 0
-			left join	CALC.v_NORAMOPSDW_Party pty
-			on			pty.OriginalParty_BK = sp.Party_BK
 			group by	  a.rowguid_AWB
 						, a.HWB
 						, a.ChargeType
@@ -283,17 +283,29 @@ from		(
 						, a.ChrgDesc
 						, cc.ReportsCategory
 						, coalesce(cur.CurrencyType, 'USD')
-						, pty.AccountNo
-						, pty.NameFull
-						, cust.CustNo
-						, cust.CustName
+						, a.rowguid_AWBInvoice
+						, a.rowguid_Vendor
 			) lvl1
+left join	ODS.NORAMOPSDW_tblAWBInvoice ai
+on			ai.rowguid_AWBInvoice = lvl1.rowguid_AWBInvoice
+and			ai.SCD_ActiveFlag = 1
+and			ai.SCD_IsDeleted = 0
+left join	ODS.NORAMOPSDW_tblCustomer cust
+on			cust.rowguid_Customer = ai.rowguid_Customer
+and			cust.SCD_ActiveFlag = 1
+and			cust.SCD_IsDeleted = 0
+left join	ODS.NORAMOPSDW_tblShipmentParty sp
+on			sp.RowID = lvl1.rowguid_Vendor
+and			sp.SCD_ActiveFlag = 1
+and			sp.SCD_IsDeleted = 0
+left join	CALC.v_NORAMOPSDW_Party pty
+on			pty.OriginalParty_BK = sp.Party_BK
 group by	  lvl1.rowguid_AWB
 			, lvl1.HWB
 			, lvl1.ChargeType
 			, lvl1.CurrencyCode
-			, cast(case when lvl1.ChargeType = 'COST' then lvl1.AccountNo end		as varchar(50))
-			, cast(case when lvl1.ChargeType = 'COST' then lvl1.NameFull end		as varchar(150))
-			, cast(case when lvl1.ChargeType = 'REVENUE' then lvl1.CustNo end	as varchar(50))
-			, cast(case when lvl1.ChargeType = 'REVENUE' then lvl1.CustName end	as varchar(150))
+			, cast(case when lvl1.ChargeType = 'COST' then pty.AccountNo end	as varchar(50))
+			, cast(case when lvl1.ChargeType = 'COST' then pty.NameFull end	as varchar(150))
+			, cast(case when lvl1.ChargeType = 'REVENUE' then cust.CustNo end	as varchar(50))
+			, cast(case when lvl1.ChargeType = 'REVENUE' then cust.CustName end	as varchar(150))
 GO
