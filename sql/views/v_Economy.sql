@@ -294,12 +294,22 @@ left join	ODS.NORAMOPSDW_tblCustomer cust
 on			cust.rowguid_Customer = ai.rowguid_Customer
 and			cust.SCD_ActiveFlag = 1
 and			cust.SCD_IsDeleted = 0
-left join	ODS.NORAMOPSDW_tblShipmentParty sp
+left join	ODS.NORAMOPSDW_tblShipmentParty sp		--resolves rowguid_Vendor to the vendor's business key (Party_BK); no SCD filter here since this specific historical row may since have been superseded
 on			sp.RowID = lvl1.rowguid_Vendor
-and			sp.SCD_ActiveFlag = 1
-and			sp.SCD_IsDeleted = 0
-left join	CALC.v_NORAMOPSDW_Party pty
-on			pty.OriginalParty_BK = sp.Party_BK
+left join	(
+			select		*
+			from		(
+						select		  Party_BK
+									, AccountNo
+									, NameFull
+									, rn	=	row_number() over (partition by Party_BK order by SCD_UpdateDate desc)
+						from		ODS.NORAMOPSDW_tblShipmentParty
+						where		SCD_ActiveFlag = 1
+						and			SCD_IsDeleted = 0
+						) x
+			where		rn = 1
+			) pty								--re-resolves that business key to its current (latest active) version, in case sp itself is stale
+on			pty.Party_BK = sp.Party_BK
 group by	  lvl1.rowguid_AWB
 			, lvl1.HWB
 			, lvl1.ChargeType
