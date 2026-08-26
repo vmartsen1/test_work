@@ -1,11 +1,29 @@
 # Reports.v_Economy — Assumptions & Open Questions
 
-Draft grain: **one row per revenue-or-cost charge line** (TMFF: `TMFF_REVENUE`/`TMFF_COST`
-row; OPS: `tblAWBInvoiceDetail`/`tblAWBCost` row), unioned across the two systems.
-Source-first pattern, same style as `v_Job`/`v_Shipment`: one filtered/joined derived
-table per branch (already at the final grain — no fan-out risk here since neither
-system's charge-line tables can multiply against their parent Job/AWB), then lookups
-attached via `left join` afterward.
+Grain: **one row per (Job or AWB) + ChargeType + Currency + Creditor/Debtor** — in the
+common case this is 2 rows per Job/Shipment (one COST, one REVENUE), which is what was
+requested. It can exceed 2 rows when a single Job/AWB genuinely has more than one currency
+or more than one counterparty on the same side (e.g. two different vendors billing cost in
+different currencies) — that's correct, not a bug: summing FC amounts across different
+currencies, or collapsing two different creditors into one code, would be wrong.
+
+Structure: source-first at the *fine* grain first (one row per underlying charge line —
+`TMFF_REVENUE`/`TMFF_COST` row, or `tblAWBInvoiceDetail`/`tblAWBCost` row), with every
+lookup (`FMPARTY`, `FMCHARGECODE`/`FMCODE`, `lkpChargeCode`, `lkpCurrency`,
+`tblCustomer`/`CALC.v_NORAMOPSDW_Party`) joined **at that fine grain** — every join key is
+still a single value at this point, so lookups always match correctly. Only the outermost
+`SELECT` aggregates up to the coarse grain, via `sum()` on the amount columns and
+`string_agg()` on `ChargeCode`/`ChargeCodeDescription`/`ChargeCodeCategory` (a Job with
+several distinct charge codes on the same side shows them comma-separated).
+
+**Bug found and avoided**: an earlier draft pushed `string_agg` for `ChrgCode` into the
+per-branch OPS subqueries (grouping before joining to `lkpChargeCode`), which meant
+`lkpChargeCode` was joined against an already-concatenated string like `"FRT, THC"` —
+that would silently return `NULL` for `ChargeCodeCategory` on any AWB with more than one
+charge code. Fixed by keeping every lookup join at the fine grain and aggregating exactly
+once, in the outermost `SELECT`, identically on both the TMFF and OPS branches (previously
+OPS aggregated twice — once per union branch, once outer — which was both the bug's cause
+and pure redundant work).
 
 ## Key design decisions
 
@@ -85,6 +103,20 @@ attached via `left join` afterward.
    comparing the *line*-currency lookup's key to the header's raw guid, which looks like it
    should be `cuh.rowguid_Currency = ivh.rowguid_Currency`. Doesn't affect `v_Economy` (I
    only use the line-level currency), but flagging in case it matters elsewhere.
+
+**`RecognitionAmountFC`** is computed at the *fine* grain (`RECOGNITIONAMTLC * (AMTFC /
+nullif(AMTLC, 0))` per charge line, before aggregation) and then `sum()`'d — summing the
+per-line ratios is correct; recomputing the ratio from already-summed `AMTFC`/`AMTLC`
+totals would silently give a wrong number whenever lines in the same group have different
+FX rates.
+
+**Still open, not resolved**: your "monster" draft set `VATAmountFC = r.ACTUALVATAMTBC` /
+`c.ACTUALVATAMTBC` for TMFF — the exact same source column already used for
+`VATActualAmountFC`. I did **not** carry that over (kept `VATAmountFC` as `NULL`, unchanged
+from before) since I can't tell whether that's the real "booked" FC-VAT column or a
+copy-paste duplicate, and you answered "no preference" both times I asked. Still needs a
+real answer: is there a distinct booked (non-actual) VAT-in-foreign-currency column on
+`TMFF_REVENUE`/`TMFF_COST`, and if so what's it called?
 
 ## Fields with no confirmed source (nulled + commented inline in the view)
 
