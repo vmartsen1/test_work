@@ -85,7 +85,6 @@ with cte_TEU as (
 						on			sci.JOB_UNID = sea.JOB_UNID
 						where		sea.SCD_ActiveFlag = 1
 						and			sea.SCD_IsDeleted = 0
-						and			coalesce(sea.CTNQTY1, sea.CTNQTY2, sea.CTNQTY3, sea.CTNQTY4) > 0
 						and			sea.LOADTERM in ('FCL','CONS')
 						and			sci.JOB_UNID is null
 						and			v.qty > 0
@@ -114,7 +113,6 @@ with cte_TEU as (
 						on			lui.JOB_UNID = road.JOB_UNID
 						where		road.SCD_ActiveFlag = 1
 						and			road.SCD_IsDeleted = 0
-						and			coalesce(road.VEHICLEQTY1, road.VEHICLEQTY2, road.VEHICLEQTY3, road.VEHICLEQTY4) > 0
 						and			jo.TPTTYPE = 'Rail'
 						and			isnull(jo.SERVICELEVEL,'') <> 'BCN'
 						and			road.LOADTERM = 'FTL'
