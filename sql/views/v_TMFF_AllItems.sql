@@ -45,11 +45,26 @@ group by	sci.JOB_UNID
 			, co.CONTTYPE
 union all
 --Items based on Cargo Load Plan (CLS) where we have a CargoItem, but no Seacontitem defined so we create virtual records.
+--CONTAINER_UNID: no direct link to ODS.TMFF_CONTAINER exists here, so containers are assigned positionally to the virtual rows (JOB_UNID + RowNumber)
+select		  x.Src
+			, x.JOB_UNID
+			, x.Company_BK
+			, x.RowNumber
+			, CONTAINER_UNID		=	cnt.UNID
+			, x.UNITUNID
+			, x.ItemVolume
+			, x.ItemWeight
+			, x.ItemPieces
+			, x.GoodsDescription
+			, x.ContainerType
+			, x.DirectTEU
+			, x.DataAgeCold
+			, x.DataAgeHot
+from		(
 select		  Src					=	'SEA'
 			, JOB_UNID				=	sea.JOB_UNID
 			, Company_BK			=	cast(s.Company_BK as varchar(50))
 			, RowNumber				=	row_number() over (partition by sea.JOB_UNID order by ctn.ctnix * 100 + 1000 + ctn.ctncnt)
-			, CONTAINER_UNID		=	cast(null as numeric)
 			, UNITUNID				=	cast(null as varchar(50))
 			, ItemVolume			=	ci.ItemVolume / (isnull(sea.CTNQTY1, 0) + isnull(sea.CTNQTY2, 0) + isnull(sea.CTNQTY3, 0) + isnull(sea.CTNQTY4, 0))
 			, ItemWeight			=	ci.ItemWeight / (isnull(sea.CTNQTY1, 0) + isnull(sea.CTNQTY2, 0) + isnull(sea.CTNQTY3, 0) + isnull(sea.CTNQTY4, 0))
@@ -134,6 +149,19 @@ on			sci.JOB_UNID = sea.JOB_UNID
 where		coalesce(sea.CTNQTY1, sea.CTNQTY2, sea.CTNQTY3, sea.CTNQTY4) > 0
 and			sci.JOB_UNID is null --filter out record where exists seacontitem, because they appear in first select
 and			sea.LOADTERM in ('FCL','CONS')
+			) x
+--N-th virtual row of the job gets the N-th container of the job (ordered by UNID).
+--Rows without a counterpart (fewer containers than declared qty) keep CONTAINER_UNID = null; surplus containers are not assigned.
+left join	(
+			select		  UNID
+						, JOB_UNID
+						, rn				=	row_number() over (partition by JOB_UNID order by UNID)
+			from		ODS.TMFF_CONTAINER
+			where		SCD_ActiveFlag = 1
+			and			SCD_IsDeleted = 0
+			) cnt
+on			cnt.JOB_UNID = x.JOB_UNID
+and			cnt.rn = x.RowNumber
 union all
 select		  Src					=	'LOADUNITITEM'
 			, JOB_UNID				=	lui.JOB_UNID
@@ -168,11 +196,26 @@ group by	lui.JOB_UNID
 			, lui.UNITUNID
 			, s.Company_BK
 union all
+--CONTAINER_UNID: no direct link to ODS.TMFF_CONTAINER exists here, so containers are assigned positionally to the virtual rows (JOB_UNID + RowNumber)
+select		  x.Src
+			, x.JOB_UNID
+			, x.Company_BK
+			, x.RowNumber
+			, CONTAINER_UNID		=	cnt.UNID
+			, x.UNITUNID
+			, x.ItemVolume
+			, x.ItemWeight
+			, x.ItemPieces
+			, x.GoodsDescription
+			, x.ContainerType
+			, x.DirectTEU
+			, x.DataAgeCold
+			, x.DataAgeHot
+from		(
 select		  Src					=	'ROAD'
 			, JOB_UNID				=	road.JOB_UNID
 			, Company_BK			=	cast(s.Company_BK as varchar(50))
 			, RowNumber				=	row_number() over (partition by road.JOB_UNID order by ctn.ctnix * 100 + 1000 + ctn.ctncnt)
-			, CONTAINER_UNID		=	cast(null as numeric)
 			, UNITUNID				=	cast(null as varchar(50))
 			, ItemVolume			=	ci.ItemVolume / (isnull(road.VEHICLEQTY1, 0) + isnull(road.VEHICLEQTY2, 0) + isnull(road.VEHICLEQTY3, 0) + isnull(road.VEHICLEQTY4, 0))
 			, ItemWeight			=	ci.ItemWeight / (isnull(road.VEHICLEQTY1, 0) + isnull(road.VEHICLEQTY2, 0) + isnull(road.VEHICLEQTY3, 0) + isnull(road.VEHICLEQTY4, 0))
@@ -252,6 +295,19 @@ where   	coalesce(road.VEHICLEQTY1, road.VEHICLEQTY2, road.VEHICLEQTY3, ro
 and     	s.TransportMode_BK = 'Rail'
 and     	s.ShipmentType_BK = 'FCL'
 and     	lui.JOB_UNID is null
+			) x
+--N-th virtual row of the job gets the N-th container of the job (ordered by UNID).
+--Rows without a counterpart (fewer containers than declared qty) keep CONTAINER_UNID = null; surplus containers are not assigned.
+left join	(
+			select		  UNID
+						, JOB_UNID
+						, rn				=	row_number() over (partition by JOB_UNID order by UNID)
+			from		ODS.TMFF_CONTAINER
+			where		SCD_ActiveFlag = 1
+			and			SCD_IsDeleted = 0
+			) cnt
+on			cnt.JOB_UNID = x.JOB_UNID
+and			cnt.rn = x.RowNumber
 union all
 --Shipments not in CONTAINER or SEACONTITEM or SEA
 select		  Src					=	'JOB'
